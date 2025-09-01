@@ -28,6 +28,8 @@ minSize <- 15; maxSize <- 500; nperm <- 10000
 min_per_group      <- 3         # High/Low 各至少多少樣本（不足就跳過 limma）
 min_pairs_spearman <- 10        # Spearman 至少配對樣本數
 
+MAKE_PLOTS <- FALSE             # 快速測試：不輸出 enrichment plots
+
 log_msg <- function(text, ..., .envir = parent.frame()) {
   ts  <- format(Sys.time(), "%H:%M:%S")
   msg <- tryCatch(glue::glue(text, ..., .envir = .envir), error = function(.) text)
@@ -42,7 +44,7 @@ read_case_list <- function(path_file){
   line <- x[grepl("^case_list_ids:", x)]
   if (length(line) == 0) return(character(0))
   ids <- sub("^case_list_ids:\\s*", "", line[1])
-  ids <- unlist(strsplit(ids, "[,\\s]+"))        # 空白或逗號切
+  ids <- unlist(strsplit(ids, "[,\\s]+"))
   unique(ids[nchar(ids) > 0])
 }
 
@@ -61,7 +63,7 @@ load_local_protein_matrix <- function(dir){
                  "GENE_SYMBOL","gene","gene_symbol")
   gcol <- intersect(gene_cols, names(dat)); if (length(gcol) == 0) gcol <- names(dat)[1]
   dat  <- dplyr::rename(dat, Gene = !!gcol[1])
-  dat$Gene <- sub("\\|.*$", "", dat$Gene)       # 取「|」前的基因名
+  dat$Gene <- sub("\\|.*$", "", dat$Gene)
   
   not_sample <- c("Gene","Entrez_Gene_Id","Entrez_Gene_Id.","ENTREZ_GENE_ID",
                   "Description","Gene_Name","GeneName","Gene_Symbol")
@@ -82,14 +84,17 @@ load_local_protein_matrix <- function(dir){
     janitor::remove_empty("cols")
   
   rn <- m$Gene
-  m  <- as.matrix(m[,-1, drop=FALSE]); suppressWarnings(storage.mode(m) <- "double")
+  m  <- as.matrix(m[,-1, drop=FALSE])
+  suppressWarnings(storage.mode(m) <- "double")
   rownames(m) <- rn
+  
   if (ncol(m) == 0) stop("讀到 0 個樣本欄位，請檢查檔案欄名")
   
   if (anyDuplicated(rownames(m))) {
     log_msg("偵測到重複基因，對重複 rows 取平均")
     m <- rowsum(m, group = rownames(m), reorder = FALSE) / as.vector(table(rownames(m)))
   }
+  
   log_msg("矩陣維度：{nrow(m)} genes × {ncol(m)} samples")
   m
 }
@@ -98,19 +103,24 @@ load_local_protein_matrix <- function(dir){
 load_local_sample_meta <- function(dir, sample_ids){
   f <- file.path(dir, "data_clinical_sample.txt")
   sample_ids <- as.character(sample_ids)
+  
   if (!file.exists(f)) {
     return(data.frame(SampleID = sample_ids, row.names = sample_ids, stringsAsFactors = FALSE))
   }
+  
   dat <- suppressMessages(
     readr::read_tsv(f, guess_max = 100000, show_col_types = FALSE, comment = "#")
   )
   dat <- as.data.frame(dat, stringsAsFactors = FALSE)
+  
   id_cols <- intersect(c("SAMPLE_ID","sample_id","Sample_ID","Sample","sample"), names(dat))
   if (length(id_cols) == 0) {
     return(data.frame(SampleID = sample_ids, row.names = sample_ids, stringsAsFactors = FALSE))
   }
+  
   dat <- dplyr::rename(dat, SampleID = !!id_cols[1])
   dat$SampleID <- as.character(dat$SampleID)
+  
   dat2 <- dat[match(sample_ids, dat$SampleID), , drop = FALSE]
   dat2$SampleID <- sample_ids
   rownames(dat2) <- sample_ids
@@ -122,6 +132,7 @@ load_brca_local_as_mae <- function(dir){
   mat  <- load_local_protein_matrix(dir)
   meta <- load_local_sample_meta(dir, colnames(mat))
   stopifnot(identical(rownames(meta), colnames(mat)))
+  
   se <- SummarizedExperiment::SummarizedExperiment(
     assays  = list(protein = mat),
     colData = S4Vectors::DataFrame(meta, row.names = rownames(meta))
@@ -143,11 +154,13 @@ extract_proteome <- function(mae) {
   } else if (inherits(mae, "SummarizedExperiment")) {
     se <- mae
   } else stop("不支援的物件類型")
+  
   an <- SummarizedExperiment::assayNames(se)
   try_names <- c("protein","proteomics","protein_quantification","protein level","protein_level")
   hit <- intersect(try_names, tolower(an))
   nm  <- if (length(hit) > 0) an[match(hit[1], tolower(an))] else an[1]
   prot <- SummarizedExperiment::assay(se, nm) %>% as.matrix()
+  
   meta <- as.data.frame(SummarizedExperiment::colData(se))
   if (!"SampleID" %in% colnames(meta)) {
     cand <- c("SAMPLE_ID","sampleId","sample_id","Sample","sample")
@@ -164,43 +177,6 @@ impute_and_filter <- function(mat, min_frac=0.75) {
   m
 }
 
-# 備用：舊版（不再用於分組）
-rank_by_limma_t <- function(mat, meta, subunit, hi_lo=0.25,
-                            covars_guess=c("batch","Batch","TMT","TMT_batch","ProteomicsBatch","Sex","Gender","Age","Stage")){
-  stopifnot(subunit %in% rownames(mat))
-  sub <- mat[subunit, ]
-  qs <- quantile(sub, probs=c(hi_lo, 1-hi_lo), na.rm=TRUE)
-  grp <- dplyr::case_when(sub <= qs[1] ~ "Low", sub >= qs[2] ~ "High", TRUE ~ "Mid")
-  keep_samples <- names(grp)[grp != "Mid"]
-  if (length(keep_samples) < 6) stop("可用樣本太少，無法做 High/Low 分組")
-  grp2 <- factor(grp[keep_samples], levels=c("Low","High"))
-  X <- t(mat[, keep_samples, drop=FALSE])
-  meta2 <- meta %>% dplyr::filter(SampleID %in% keep_samples)
-  meta2 <- meta2[match(keep_samples, meta2$SampleID), , drop=FALSE]
-  covars <- intersect(covars_guess, colnames(meta2))
-  if (length(covars) > 0) {
-    design <- model.matrix(~ 0 + grp2 + ., data = data.frame(grp2=grp2, meta2[, covars, drop=FALSE]))
-    colnames(design)[1:2] <- c("Low","High")
-  } else { design <- model.matrix(~ 0 + grp2); colnames(design) <- c("Low","High") }
-  fit <- limma::lmFit(t(X), design)
-  contr <- limma::makeContrasts(High - Low, levels = design)
-  fit2 <- limma::eBayes(limma::contrasts.fit(fit, contr))
-  t_stat <- fit2$t[,1]
-  stats <- sort(setNames(t_stat, rownames(mat)), decreasing = TRUE)
-  stats[!is.na(stats)]
-}
-
-rank_by_spearman <- function(mat, subunit){
-  stopifnot(subunit %in% rownames(mat))
-  sub <- mat[subunit, ]
-  rho <- apply(mat, 1, function(x){
-    ok <- stats::complete.cases(x, sub)
-    if (sum(ok) >= 5) suppressWarnings(stats::cor(x[ok], sub[ok], method="spearman")) else NA_real_
-  })
-  sort(rho[!is.na(rho)], decreasing = TRUE)
-}
-
-# Spearman：用原始值（pairwise-complete），不補值
 rank_by_spearman_raw <- function(mat_raw, subunit, min_pairs = 10){
   stopifnot(subunit %in% rownames(mat_raw))
   sub <- mat_raw[subunit, ]
@@ -215,13 +191,8 @@ rank_by_spearman_raw <- function(mat_raw, subunit, min_pairs = 10){
   sort(rho[!is.na(rho)], decreasing = TRUE)
 }
 
-## ---- 檔名清理（避免 : / 空白 等）----
-safe_name <- function(x) {
-  gsub("[^A-Za-z0-9._-]+", "_", x)
-}
-
-## ---- 通用 GSEA 跑法（依任何基因集清單）----
-run_fgsea_save_generic <- function(stats, genesets, out_prefix, top_plot_n = 3, plot_title = "") {
+# 不畫圖版本
+run_fgsea_save <- function(stats, genesets, out_prefix, top_plot_n=0, plot_title=""){
   dir.create(dirname(out_prefix), recursive = TRUE, showWarnings = FALSE)
   res <- fgsea(pathways = genesets, stats = stats, minSize = minSize, maxSize = maxSize, nperm = nperm) |>
     dplyr::arrange(padj, dplyr::desc(NES))
@@ -230,56 +201,94 @@ run_fgsea_save_generic <- function(stats, genesets, out_prefix, top_plot_n = 3, 
   openxlsx::addWorksheet(wb, "GSEA")
   openxlsx::writeData(wb, 1, as.data.frame(res))
   openxlsx::saveWorkbook(wb, paste0(out_prefix, ".xlsx"), overwrite = TRUE)
-  if (nrow(res) > 0) {
-    to_plot <- head(res$pathway, min(top_plot_n, nrow(res)))
-    for (pw in to_plot) {
-      fn <- paste0(out_prefix, "_", safe_name(pw), ".pdf")
-      try({
-        pdf(fn, width = 6, height = 4)
-        print(plotEnrichment(genesets[[pw]], stats) + ggtitle(glue::glue("{plot_title}\n{pw}")))
-        dev.off()
-      }, silent = TRUE)
+  
+  # 若未來要開啟畫圖，將 MAKE_PLOTS <- TRUE 並提供 top_plot_n
+  if (isTRUE(MAKE_PLOTS) && top_plot_n > 0) {
+    topH <- res |> dplyr::filter(grepl("^HALLMARK_", pathway)) |> dplyr::arrange(padj) |> head(top_plot_n)
+    if (nrow(topH) > 0) {
+      for (pw in topH$pathway) {
+        fn <- paste0(out_prefix, "_", gsub("[^A-Za-z0-9_]+","_", pw), ".pdf")
+        try({
+          pdf(fn, width=6, height=4)
+          print(plotEnrichment(genesets[[pw]], stats) + ggtitle(glue::glue("{plot_title}\n{pw}")))
+          dev.off()
+        }, silent = TRUE)
+      }
     }
   }
   res
 }
 
-## ===== 三、基因集（H + C1–C8，依 category / subcategory 分組；不依賴欄位名稱） =====
-log_msg("下載 MSigDB 全人類 collections（H, C1–C8）並依組別分開")
 
-cats <- c("H", paste0("C", 1:8))
+# Windows 安全檔名（資料夾/檔名前綴）
+safe_fs_name <- function(s) {
+  s <- gsub('[<>:"/\\\\|?*]', "_", s)  # 換掉 Windows 不允許字元
+  s <- gsub("\\s+", "_", s)            # 空白變底線
+  s
+}
 
-# 產生一個清單：names 為 group（如 "H"、"C2__REACTOME"），值為 {pathway -> gene vector}
+
+## ===== 三、基因集（只取 H、C2 KEGG legacy、C3 TFT legacy、C6；各自分組） =====
+log_msg("下載 MSigDB：H、C2(KEGG-legacy)、C3(TFT-legacy)、C6；各自分組")
+
 genesets_by_group <- list()
+.get_subcat_col <- function(df){
+  cand <- c("gs_subcat","subcategory","sub_category","gs_subcategory")
+  cand[cand %in% names(df)][1]
+}
 
-for (cat in cats) {
-  df <- msigdbr(species = "Homo sapiens", category = cat)
-  
-  # 相容不同版本欄位名稱，找「子集合」欄位
-  subcat_candidates <- c("gs_subcat", "subcategory", "sub_category", "gs_subcategory")
-  subcat_col <- subcat_candidates[subcat_candidates %in% names(df)]
-  if (length(subcat_col) == 0) {
-    df$.__subcat__ <- NA_character_
+# H：Hallmark
+df_H <- msigdbr(species = "Homo sapiens", category = "H")
+if (nrow(df_H) > 0) {
+  gs_list <- lapply(split(df_H$gene_symbol, df_H$gs_name), unique)
+  genesets_by_group[["H"]] <- gs_list
+}
+
+# C2：只要 KEGG（legacy）
+df_C2 <- msigdbr(species = "Homo sapiens", category = "C2")
+if (nrow(df_C2) > 0) {
+  subcol <- .get_subcat_col(df_C2)
+  subtxt  <- if (!is.null(subcol)) df_C2[[subcol]] else NA_character_
+  keep <- grepl("KEGG", paste(df_C2$gs_name, subtxt), ignore.case = TRUE)
+  df_C2_ke <- df_C2[keep, , drop = FALSE]
+  if (nrow(df_C2_ke) > 0) {
+    grp <- if (!is.null(subcol) && all(!is.na(df_C2_ke[[subcol]]))) {
+      paste0("C2__", unique(df_C2_ke[[subcol]])[1])
+    } else "C2__KEGG"
+    gs_list <- lapply(split(df_C2_ke$gene_symbol, df_C2_ke$gs_name), unique)
+    genesets_by_group[[grp]] <- gs_list
   } else {
-    df$.__subcat__ <- df[[subcat_col[1]]]
+    log_msg("注意：你的 msigdbr 版本內沒有 C2-KEGG（可能因授權移除），此 group 將略過")
   }
-  
-  # 建立 group 名稱（有 subcat 就 "C2__REACTOME"，否則就是 "H" 或 "C3"）
-  df$.__group__ <- ifelse(is.na(df$.__subcat__) | df$.__subcat__ == "",
-                          cat, paste0(cat, "__", df$.__subcat__))
-  
-  # 依 group 分拆，並轉成 pathway -> genes 的清單
-  split_by_group <- split(df, df$.__group__)
-  for (grp in names(split_by_group)) {
-    dfg <- split_by_group[[grp]]
-    # 注意 pathway 欄位固定是 gs_name；gene 欄位固定是 gene_symbol
-    gs_list <- lapply(split(dfg$gene_symbol, dfg$gs_name), unique)
+}
+
+# C3：只要 TFT（legacy）
+df_C3 <- msigdbr(species = "Homo sapiens", category = "C3")
+if (nrow(df_C3) > 0) {
+  subcol <- .get_subcat_col(df_C3)
+  subtxt  <- if (!is.null(subcol)) df_C3[[subcol]] else NA_character_
+  keep_tft <- grepl("TFT", subtxt, ignore.case = TRUE)
+  keep_leg <- grepl("TRANSFAC|JASPAR|LEGACY", paste(subtxt, df_C3$gs_name), ignore.case = TRUE)
+  df_C3_tft_legacy <- df_C3[keep_tft & keep_leg, , drop = FALSE]
+  if (nrow(df_C3_tft_legacy) == 0) df_C3_tft_legacy <- df_C3[keep_tft, , drop = FALSE]
+  if (nrow(df_C3_tft_legacy) > 0) {
+    grp <- if (!is.null(subcol) && all(!is.na(df_C3_tft_legacy[[subcol]]))) {
+      paste0("C3__", unique(df_C3_tft_legacy[[subcol]])[1])
+    } else "C3__TFT"
+    gs_list <- lapply(split(df_C3_tft_legacy$gene_symbol, df_C3_tft_legacy$gs_name), unique)
     genesets_by_group[[grp]] <- gs_list
   }
 }
 
-log_msg("完成載入 {length(genesets_by_group)} 個 gene set groups：{paste(head(names(genesets_by_group), 10), collapse=', ')}{if (length(genesets_by_group)>10) ' ...' else ''}")
+# C6：Oncogenic signatures
+df_C6 <- msigdbr(species = "Homo sapiens", category = "C6")
+if (nrow(df_C6) > 0) {
+  gs_list <- lapply(split(df_C6$gene_symbol, df_C6$gs_name), unique)
+  genesets_by_group[["C6"]] <- gs_list
+}
 
+log_msg("取得 gene-set groups：{paste(names(genesets_by_group), collapse=', ')}")
+if (!length(genesets_by_group)) stop("沒有可用的 gene sets（H/C2-KEGG/C3-TFT/C6）")
 
 ## ===== 四、執行：只跑本地 BRCA =====
 study_id   <- "brca_cptac_2020"
@@ -309,7 +318,7 @@ if (is.finite(mx) && mx > 100) {
   mat0 <- log2(mat0 + 1)
 }
 
-# 5) 缺失過濾 + MNAR 填補（僅供 limma 使用；分組與 Spearman 用 mat0 原值）
+# 5) 缺失過濾 + MNAR 填補（注意：分組仍會用 mat0 的原值）
 log_msg("缺失過濾與填補")
 mat <- impute_and_filter(mat0, min_frac = min_frac_complete)
 
@@ -328,12 +337,13 @@ for (su in csn_subunits) {
   
   ## --- 1) 用原始值分組（不補值；保留樣本名稱） ---
   sub_raw <- mat0[su, ]
-  v <- sub_raw[!is.na(sub_raw)]                    # 非 NA 值（帶 names=樣本ID）
+  v <- sub_raw[!is.na(sub_raw)]
   if (length(v) < (2 * min_per_group)) {
     log_msg("    可用樣本過少（非NA={length(v)}），略過 limma")
+    stats_t <- NULL
   } else {
     qs <- quantile(v, probs = c(hi_lo_quantile, 1 - hi_lo_quantile), names = FALSE)
-    grp <- setNames(rep("Mid", length(sub_raw)), names(sub_raw))   # 關鍵：保留 names
+    grp <- setNames(rep("Mid", length(sub_raw)), names(sub_raw))
     grp[names(v)[v <= qs[1]]] <- "Low"
     grp[names(v)[v >= qs[2]]] <- "High"
     
@@ -341,7 +351,6 @@ for (su in csn_subunits) {
     n_high <- sum(grp[keep_samples] == "High")
     n_low  <- sum(grp[keep_samples] == "Low")
     
-    ## 若分位因 ties 造成 High/Low=0，改用排名 fallback 取前/後 k 名
     if (n_high == 0 || n_low == 0) {
       k <- max(min_per_group, ceiling(hi_lo_quantile * length(v)))
       ord_asc  <- names(sort(v, decreasing = FALSE))
@@ -357,9 +366,9 @@ for (su in csn_subunits) {
       log_msg("    量化分位遇到 ties，已改用排名 fallback：High={n_high}, Low={n_low}")
     }
     
-    ## --- 2) limma：樣本足夠 → 用補值矩陣且移除該 subunit 列；並對每個 gene set group 各自輸出 ---
     if (length(keep_samples) < (2 * min_per_group) || n_high < min_per_group || n_low < min_per_group) {
       log_msg("    樣本不足（High={n_high}, Low={n_low}，門檻各≥{min_per_group}），略過 limma")
+      stats_t <- NULL
     } else {
       mat_limma <- mat[setdiff(rownames(mat), su), keep_samples, drop = FALSE]
       meta2     <- meta %>% dplyr::filter(SampleID %in% keep_samples)
@@ -378,43 +387,50 @@ for (su in csn_subunits) {
         t_stat <- fit2$t[, 1]
         sort(t_stat[!is.na(t_stat)], decreasing = TRUE)
       }, error = function(e){ log_msg("    limma 排名失敗：{e$message}"); NULL })
-      
-      if (!is.null(stats_t)) {
-        for (grp_label in names(genesets_by_group)) {
-          gs <- genesets_by_group[[grp_label]]
-          subgrp_dir  <- file.path(out_dir, safe_name(grp_label))
-          dir.create(subgrp_dir, showWarnings = FALSE, recursive = TRUE)
-          out_prefix  <- file.path(subgrp_dir, "GSEA_limma_t")
-          run_fgsea_save_generic(
-            stats = stats_t,
-            genesets = gs,
-            out_prefix = out_prefix,
-            top_plot_n = 3,
-            plot_title = glue::glue("{study_id} | {su} | High vs Low (Q{round(hi_lo_quantile*100)} vs Q{round((1-hi_lo_quantile)*100)}) | {grp_label}")
-          )
-        }
-        saveRDS(stats_t, file.path(out_dir, "rank_stats_limma_t.rds"))
-      }
     }
   }
   
-  ## --- 3) Spearman：用原始值（pairwise-complete），不補值；對每個 group 各自輸出 ---
+  ## --- 2) 依 group 跑 GSEA（limma & spearman），分開輸出 ---
+  # limma（若有）
+  if (!is.null(stats_t)) {
+    for (grp_name in names(genesets_by_group)) {
+      gs <- genesets_by_group[[grp_name]]
+      safe_grp <- safe_fs_name(grp_name)
+      if (safe_grp != grp_name) {
+        log_msg("    注意：group 名稱含不支援字元，已改為 {safe_grp}")
+      }
+      subdir <- file.path(out_dir, safe_grp)
+      dir.create(subdir, recursive = TRUE, showWarnings = FALSE)
+      run_fgsea_save(
+        stats = stats_t, genesets = gs,
+        out_prefix = file.path(subdir, "GSEA_limma_t"),
+        top_plot_n = 0,
+        plot_title = glue::glue("{study_id} | {su} | High vs Low | {grp_name}")
+      )
+    }
+    saveRDS(stats_t, file.path(out_dir, "rank_stats_limma_t.rds"))
+  }
+  
+  
+  # Spearman raw（一定跑；不足會在函式內丟錯被捕捉）
   stats_rho <- tryCatch(
     rank_by_spearman_raw(mat0, su, min_pairs = min_pairs_spearman),
     error = function(e){ log_msg("    Spearman 無法進行：{e$message}"); NULL }
   )
   if (!is.null(stats_rho)) {
-    for (grp_label in names(genesets_by_group)) {
-      gs <- genesets_by_group[[grp_label]]
-      subgrp_dir  <- file.path(out_dir, safe_name(grp_label))
-      dir.create(subgrp_dir, showWarnings = FALSE, recursive = TRUE)
-      out_prefix  <- file.path(subgrp_dir, "GSEA_spearman_raw")
-      run_fgsea_save_generic(
-        stats = stats_rho,
-        genesets = gs,
-        out_prefix = out_prefix,
-        top_plot_n = 3,
-        plot_title = glue::glue("{study_id} | {su} | Spearman (raw, pairwise-complete) | {grp_label}")
+    for (grp_name in names(genesets_by_group)) {
+      gs <- genesets_by_group[[grp_name]]
+      safe_grp <- safe_fs_name(grp_name)
+      if (safe_grp != grp_name) {
+        log_msg("    注意：group 名稱含不支援字元，已改為 {safe_grp}")
+      }
+      subdir <- file.path(out_dir, safe_grp)
+      dir.create(subdir, recursive = TRUE, showWarnings = FALSE)
+      run_fgsea_save(
+        stats = stats_rho, genesets = gs,
+        out_prefix = file.path(subdir, "GSEA_spearman_raw"),
+        top_plot_n = 0,
+        plot_title = glue::glue("{study_id} | {su} | Spearman(raw) | {grp_name}")
       )
     }
     saveRDS(stats_rho, file.path(out_dir, "rank_stats_spearman_raw.rds"))
