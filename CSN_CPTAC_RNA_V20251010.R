@@ -231,7 +231,7 @@ safe_fs_name <- function(s) {
 #GENESET_GROUPS_TO_RUN <- c("C5:BP","C5:CC","C5:MF")
 #GENESET_GROUPS_TO_RUN <- c("H","C3:MIR","C2:CP:REACTOME","C5:GO:BP")
 
-GENESET_GROUPS_TO_RUN <- c("C3:TFT:GTRD")
+GENESET_GROUPS_TO_RUN <- c("H")
 
 
 
@@ -1718,6 +1718,110 @@ get_batch_factor <- function(ds_dir, sample_ids,
   list(name = det$name, fac = fac)
 }
 
+
+## =========================
+## [RNA overrides] for FPKM (log transformed) cBioPortal CPTAC
+## 目的：最小改動，把 protein 版流程無縫轉成 RNA 版
+## 位置：貼在原始檔「讀檔與共用工具」區塊之後、首次使用 loader 前
+## =========================
+
+## 1) 輸出前綴改為 RNA 專用（避免與 protein 混在一起）
+if (!exists("COMBO_PREFIX", inherits = TRUE) || is.null(COMBO_PREFIX)) {
+  COMBO_PREFIX <- "csn_rna_gsea_results_TP53_by_collection"
+}
+
+
+## 2) 無 batch 資料集時預設啟用 SVA（RNA 慣例常見；你可改回 FALSE）
+if (!exists("USE_NO_BATCH_SVA", inherits = TRUE)) USE_NO_BATCH_SVA <- TRUE
+USE_NO_BATCH_SVA_DATASETS <- character(0)
+.use_no_batch_sva <- function(ds_id) {
+  if (length(USE_NO_BATCH_SVA_DATASETS) && ds_id %in% USE_NO_BATCH_SVA_DATASETS) return(TRUE)
+  isTRUE(USE_NO_BATCH_SVA)
+}
+
+## 3) 覆寫 loader：讀取多種 RNA 檔名（FPKM/RSEM/RPKM）
+load_matrix_from_dataset_dir <- function(dir){
+  # 依序嘗試下列檔名（擇一命中）
+  candidates <- c(
+    "data_mrna_seq_fpkm.txt",
+    "data_mrna_seq_v2_rsem.txt",
+    "data_mrna_seq_rpkm.txt",
+    "data_mrna_seq_rsem.txt"
+  )
+  hit_flags <- file.exists(file.path(dir, candidates))
+  if (!any(hit_flags)) {
+    stop(glue::glue(
+      "找不到 RNA 檔案：{dir}\n已嘗試：{paste(candidates, collapse = ', ')}"
+    ))
+  }
+  fp <- file.path(dir, candidates[which(hit_flags)[1]])
+  log_msg("讀取 RNA 矩陣：{basename(fp)}")
+  
+  dat <- suppressMessages(readr::read_tsv(fp, guess_max = 200000, show_col_types = FALSE))
+  
+  gene_cols <- c("Hugo_Symbol","hugo_symbol","Gene","Gene_Symbol","HugoSymbol","GENE_SYMBOL","gene","gene_symbol")
+  gcol <- intersect(gene_cols, names(dat)); if (!length(gcol)) gcol <- names(dat)[1]
+  dat <- dplyr::rename(dat, Gene = !!gcol[1]); dat$Gene <- sub("\\|.*$","", dat$Gene)
+  
+  not_sample <- c("Gene","Entrez_Gene_Id","Entrez_Gene_Id.","ENTREZ_GENE_ID","Description","Gene_Name","GeneName","Gene_Symbol")
+  sample_cols_all <- setdiff(names(dat), not_sample)
+  
+  ## RNA 專用 case list：優先採用與命中 data 檔名對應者，其次回退常見名稱
+  bn <- basename(fp)  # 例如 "data_mrna_seq_v2_rsem.txt"
+  case_candidates <- c(
+    file.path(dir, "case_lists", sub("^data_", "cases_", bn)),
+    file.path(dir, "case_lists", "cases_mrna_seq_fpkm.txt"),
+    file.path(dir, "case_lists", "cases_mrna_seq_v2_rsem.txt"),
+    file.path(dir, "case_lists", "cases_mrna_seq_rpkm.txt"),
+    file.path(dir, "case_lists", "cases_mrna_seq_rsem.txt")
+  )
+  case_hit <- case_candidates[file.exists(case_candidates)]
+  keep_ids <- if (length(case_hit)) read_case_list(case_hit[1]) else character(0)
+  
+  if (length(keep_ids)) {
+    inter <- intersect(sample_cols_all, keep_ids)
+    sample_cols <- if (length(inter) >= 10) inter else sample_cols_all
+    if (length(inter) < 10) log_msg("提示：case_list 交集太小（%d），改用全部樣本欄位", length(inter))
+  } else {
+    sample_cols <- sample_cols_all
+  }
+  
+  m <- dat %>% dplyr::select(Gene, dplyr::all_of(sample_cols)) %>% janitor::remove_empty("cols")
+  rn <- m$Gene
+  m  <- as.matrix(m[, -1, drop = FALSE]); storage.mode(m) <- "double"; rownames(m) <- rn
+  
+  if (ncol(m) == 0) stop("讀到 0 個樣本欄位")
+  if (anyDuplicated(rownames(m))) {
+    log_msg("偵測到重複基因，對重複 rows 取平均")
+    m <- rowsum(m, group = rownames(m), reorder = FALSE) / as.vector(table(rownames(m)))
+  }
+  log_msg("RNA 矩陣維度：%d genes × %d samples", nrow(m), ncol(m))
+  m
+}
+
+
+## 4) 覆寫插補/過濾：RNA 不用 MinProb；保留你原本的 min_frac 概念
+impute_and_filter <- function(mat, min_frac = 0.75) {
+  ## 僅以「基因在樣本中的非 NA 比例」過濾；一般 FPKM-log 缺失很少
+  keep <- rowMeans(is.finite(mat)) >= min_frac
+  m <- mat[keep, , drop = FALSE]
+  
+  ## 若仍有零星缺值，採「基因內中位數」輕量插補，避免影響 limma / Spearman
+  if (anyNA(m)) {
+    meds <- apply(m, 1, function(v) median(v[is.finite(v)], na.rm = TRUE))
+    for (i in seq_len(nrow(m))) {
+      vi <- m[i, ]
+      vi[!is.finite(vi)] <- meds[i]
+      m[i, ] <- vi
+    }
+  }
+  m
+}
+
+## 5) 其它分析（TP53 分層、CSN score 以 RNA 子單元計算、residual subunits、
+##    limma 連續預測子、partial-Spearman 殘差化、GSEA、彙整/熱圖/meta-FDR）皆維持原流程。
+
+
 ## ---- 批次需求快篩（沿用你的邏輯）----
 screen_batch_need <- function(ds_dir, min_frac_complete = 0.75){
   log_msg("== Batch 檢查：%s ==", basename(ds_dir))
@@ -1739,7 +1843,11 @@ screen_batch_need <- function(ds_dir, min_frac_complete = 0.75){
           bi$name, nlevels(batch),
           paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse=", "))
   
-  X  <- t(scale(t(m), center = TRUE, scale = TRUE))
+  ## 避免 zero-variance 基因造成 scale() 出錯（僅影響 PCA，limma F 檢定仍用原始 m）
+  keep_var <- matrixStats::rowSds(m, na.rm = TRUE) > 0
+  if (!all(keep_var)) log_msg("  [PCA] 移除 zero-variance 基因：%d", sum(!keep_var))
+  m_z <- m[keep_var, , drop = FALSE]
+  X  <- t(scale(t(m_z), center = TRUE, scale = TRUE))
   pc <- prcomp(t(X), scale. = FALSE)
   K  <- min(5, ncol(pc$x))
   r2 <- vapply(seq_len(K), function(i) summary(lm(pc$x[,i] ~ batch))$r.squared, numeric(1))
@@ -1789,8 +1897,8 @@ COMBO_MODE <- "combo_2"
 
 ## ---- [NEW | COMBO PRESETS: choose one] ----
 ## 選擇其中一個： "combo_1" / "combo_2" / "combo_3"；若不設定 (NULL) 則維持原行為
-COMBO_MODE   <- get0("COMBO_MODE", ifnotfound = NULL)
-COMBO_PREFIX <- if (!is.null(COMBO_MODE)) COMBO_MODE else NULL
+COMBO_MODE <- get0("COMBO_MODE", ifnotfound = NULL)
+COMBO_PREFIX <- if (!is.null(COMBO_MODE)) paste0("mRNA_", COMBO_MODE) else NULL
 
 .combo_ds_1 <- c("brca_cptac_2020","luad_cptac_2020","lusc_cptac_2021","ucec_cptac_2020")
 .combo_ds_7 <- c("brca_cptac_2020","luad_cptac_2020","lusc_cptac_2021","ucec_cptac_2020",
@@ -2809,14 +2917,16 @@ run_predictor_analyses <- function(
   ## -------- BatchAdj：同上；batch 進設計表 → **中心化 predictor** --------
   DF_ba <- data.frame(predictor = as.numeric(pred), row.names = sample_order, check.names = FALSE)
   if (!is.null(X_ba_cov)) for (nm in colnames(X_ba_cov)) DF_ba[[nm]] <- X_ba_cov[[nm]]
-  if (!is.null(batch_all)) DF_ba$batch <- droplevels(as.factor(batch_all[sample_order]))
+  ## [BatchAdj no-batch mode] 不納入 batch 欄位（即使 batch_all 存在）
+  # if (!is.null(batch_all)) DF_ba$batch <- droplevels(as.factor(batch_all[sample_order]))
+  
   ## NEW: 若沒有 batch，嘗試 SVA；失敗再退 tech PCs
   sv_ba   <- NULL
   tech_ba <- NULL
   if (is.null(batch_all) && !.use_no_batch_sva(ds_id)) 
     logf("[SVA/tech|%s|BatchAdj] both skipped; proceed with base covariates only", predictor_name)
-  if (is.null(batch_all) && !.use_no_batch_sva(ds_id)) logf("[SVA|%s|BatchAdj] skip: no-batch dataset and USE_NO_BATCH_SVA=FALSE", predictor_name)
-  if (is.null(batch_all) && .use_no_batch_sva(ds_id)) {
+  if (!.use_no_batch_sva(ds_id)) logf("[SVA|%s|BatchAdj] skip: no-batch dataset and USE_NO_BATCH_SVA=FALSE", predictor_name)
+  if (.use_no_batch_sva(ds_id)) {
     logf("[SVA|pre] DF_ba cols = {%s}", paste(colnames(DF_ba), collapse = ","))
     ## 1) SVA 用的設計（允許 NA，避免丟樣本 → 與 M 對齊）
     ## --- 組 des_for_sva / des0_for_sva：用欄名動態建式（0 欄退成 ~ 1） ---
@@ -4474,7 +4584,7 @@ run_mroast_save <- function(expr_mat, design, coef_or_contrast, pathways, out_di
 }
 
 ## ===== DO_AUDIT 開關包住 QC/探索（4）=====
-DO_AUDIT <- TRUE  # <— 預設關閉；需要時改 TRUE
+DO_AUDIT <- FALSE  # <— 預設關閉；需要時改 TRUE
 
 if (DO_AUDIT) {
   results <- list()
@@ -4485,7 +4595,7 @@ if (DO_AUDIT) {
   }
   
   ds_dir <- file.path(getwd(), "brca_cptac_2020")
-  if (dir.exists(ds_dir)) try(inspect_plex(ds_dir), silent = TRUE)
+  # (RNA 版不適用) if (dir.exists(ds_dir)) try(inspect_plex(ds_dir), silent = TRUE)
   
   sex_age_batch_audit <- audit_all_datasets_sa_batch(dataset_dirs)
   print(sex_age_batch_audit)
@@ -5244,7 +5354,7 @@ csn_pairwise_correlation_one_ds <- function(
   # Dataset-level（與特定 predictor 無關）SVA：mod= cov0(+batch)，mod0= ~1
   sv_df <- NULL
   # 只有在沒有 batch 的情況下才嘗試 SVA（符合 batch > SV > tech PC 優先序）
-  if (is.null(batch) && .use_no_batch_sva(ds_id) && exists("estimate_svs", mode = "function")) {
+  if (.use_no_batch_sva(ds_id) && exists("estimate_svs", mode = "function")) {
     # 先確保 Mimp 沒有遺漏值（理論上 impute.MinProb 後不會有，但保險）
     if (any(!is.finite(Mimp))) {
       for (i in seq_len(nrow(Mimp))) {
@@ -5293,12 +5403,14 @@ csn_pairwise_correlation_one_ds <- function(
   
   # Tech PCs（前 2 個）；per-pair 會用 gate_tech_pcs() 依 predictor 篩
   tech_df <- NULL
-  pc <- try(stats::prcomp(t(Mimp), center = TRUE, scale. = TRUE), silent = TRUE)
-  if (!inherits(pc, "try-error") && !is.null(pc$x)) {
-    k <- min(2L, ncol(pc$x))
-    tech_df <- as.data.frame(pc$x[, seq_len(k), drop = FALSE])
-    colnames(tech_df) <- paste0("PC", seq_len(k))
-    rownames(tech_df) <- rownames(tech_df)  # sample names already in rownames(pc$x)
+  if (.use_no_batch_sva(ds_id)) {
+    pc <- try(stats::prcomp(t(Mimp), center = TRUE, scale. = TRUE), silent = TRUE)
+    if (!inherits(pc, "try-error") && !is.null(pc$x)) {
+      k <- min(2L, ncol(pc$x))
+      tech_df <- as.data.frame(pc$x[, seq_len(k), drop = FALSE])
+      colnames(tech_df) <- paste0("PC", seq_len(k))
+      rownames(tech_df) <- rownames(tech_df)  # sample names already in rownames(pc$x)
+    }
   }
   
   # 兩兩配對
@@ -5383,21 +5495,14 @@ csn_pairwise_correlation_one_ds <- function(
       )
     }
     
-    ## ---- 版本 3: BatchAdj_covars（優先序：batch > SV > tech PCs；三者互斥）----
-    cov_ba <- cov_raw               # 先沿用 RAW 的共變項選擇
-    batch_for_res <- NULL           # 只在「使用 batch」時帶入 residualize_to_covars 的 batch 參數
-    
-    if (!is.null(batch)) {
-      # 有 batch：只用 batch（不再加 SV/tech）
-      batch_for_res <- batch
-      
-    } else if (.use_no_batch_sva(ds_id) && !is.null(sv_df)) {
-      # 沒有 batch，有 SV：只用 SV（不再加 tech）
+    ## ---- 版本 3: BatchAdj_covars（RNA 版：一律忽略 batch；SV 由 USE_NO_BATCH_SVA 控制）----
+    cov_ba <- cov_raw               # 仍保留 sex/age/purity
+    # 不論是否偵測到 batch，BatchAdj 一律視為「沒有 batch」
+    # 是否加入 SV / tech PCs 僅由 .use_no_batch_sva(ds_id) 控制
+    if (.use_no_batch_sva(ds_id) && !is.null(sv_df)) {
       sv_aln <- sv_df[sam_all, , drop = FALSE]
       cov_ba <- cbind(cov_ba, sv_aln)
-      
     } else if (.use_no_batch_sva(ds_id) && !is.null(tech_df)) {
-      # 沒有 batch、也沒有 SV：退而用 tech PCs（以 predictor=x 做 gating；若無 gate_tech_pcs 就直接用前2PC）
       if (exists("gate_tech_pcs", mode = "function")) {
         tech_g <- gate_tech_pcs(tech_df[sam_all, , drop = FALSE], v = as.numeric(x))
       } else {
@@ -5406,8 +5511,8 @@ csn_pairwise_correlation_one_ds <- function(
       cov_ba <- cbind(cov_ba, tech_g)
     }
     
-    xb <- residualize_to_covars(x, batch = batch_for_res, covars = cov_ba)
-    yb <- residualize_to_covars(y, batch = batch_for_res, covars = cov_ba)
+    xb <- residualize_to_covars(x, batch = NULL, covars = cov_ba)
+    yb <- residualize_to_covars(y, batch = NULL, covars = cov_ba)
     ok3 <- stats::complete.cases(xb, yb)
     
     if (sum(ok3) >= min_pairs) {

@@ -231,7 +231,7 @@ safe_fs_name <- function(s) {
 #GENESET_GROUPS_TO_RUN <- c("C5:BP","C5:CC","C5:MF")
 #GENESET_GROUPS_TO_RUN <- c("H","C3:MIR","C2:CP:REACTOME","C5:GO:BP")
 
-GENESET_GROUPS_TO_RUN <- c("C3:TFT:GTRD")
+GENESET_GROUPS_TO_RUN <- c("C4:3CA")
 
 
 
@@ -5705,6 +5705,13 @@ suppressPackageStartupMessages({
   library(forcats)
 })
 
+## == Y 軸長 label 視覺參數（可用 options 覆寫）==
+options(
+  csn_ylabel_wrap        = 40,   # 每行約 40 字元自動換行
+  csn_left_margin_pts    = 160,  # 左側邊界（pt）；給長標籤空間
+  csn_ylabel_extra_width = 7.5   # 另加到圖寬（in），避免熱圖被擠
+)
+
 
 ## ===== Cell 風格：正值橘、負值綠（多組可選）=====
 CELL_OG_PALETTES <- list(
@@ -5803,20 +5810,21 @@ CELL_OG_PALETTES <- list(
       expand = ggplot2::expansion(mult = c(0.01, 0.01)),
       position = "top"
     ) +
+    ggplot2::scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = getOption("csn_ylabel_wrap", 40))) +
     ggplot2::labs(x = NULL, y = NULL) +
     ggplot2::theme_minimal(base_size = 11) +
     ggplot2::theme(
       panel.grid = ggplot2::element_blank(),
       axis.text.x.top = ggplot2::element_text(angle = 45, hjust = 0, vjust = 0, size = 9, margin = ggplot2::margin(b = 8)),
-      axis.text.y = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 9, lineheight = 0.9),
       legend.position = "right",
-      plot.margin = ggplot2::margin(6, 12, 6, 6),
+      plot.margin = ggplot2::margin(6, 12, 6, getOption("csn_left_margin_pts", 160)),
       plot.background  = ggplot2::element_rect(fill = "white", colour = NA),
       panel.background = ggplot2::element_rect(fill = "white", colour = NA)
     ) + ggplot2::coord_cartesian(clip = "off")
   
   n_path <- nlevels(df_long$pathway)
-  W <- max(8, length(present_preds) * 0.45)
+  W <- max(8, length(present_preds) * 0.45) + getOption("csn_ylabel_extra_width", 2.5)   # inches
   H <- max(6, n_path * 0.22)
   list(plot = p, width = W, height = H)
 }
@@ -6001,7 +6009,8 @@ CELL_OG_PALETTES <- list(
   
   # 尺寸：隨 pathway 數量調整
   n_path <- nlevels(df_long$pathway)
-  W <- max(8, length(present_preds) * 0.45)   # inches
+    W <- max(8, length(present_preds) * 0.45) + getOption("csn_ylabel_extra_width", 2.5)
+   # inches
   H <- max(6, n_path * 0.22)                  # inches
   list(plot = p, width = W, height = H)
 }
@@ -6165,7 +6174,7 @@ CELL_OG_PALETTES <- list(
     ) + coord_cartesian(clip = "off")
   
   n_path <- nlevels(df_long$pathway)
-  W <- max(8, length(present_preds) * 0.45)
+  W <- max(8, length(present_preds) * 0.45) + getOption("csn_ylabel_extra_width", 2.5)
   H <- max(6, n_path * 0.22)
   list(plot = p, width = W, height = H)
 }
@@ -6902,20 +6911,21 @@ if (!exists(".pred_order_all", mode = "any")) {
       expand = ggplot2::expansion(mult = c(0.01, 0.01)),
       position = "top"
     ) +
+    ggplot2::scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = getOption("csn_ylabel_wrap", 40))) +
     ggplot2::labs(x = NULL, y = NULL) +
     ggplot2::theme_minimal(base_size = 11) +
     ggplot2::theme(
       panel.grid = ggplot2::element_blank(),
       axis.text.x.top = ggplot2::element_text(angle = 45, hjust = 0, vjust = 0, size = 9, margin = ggplot2::margin(b = 8)),
-      axis.text.y = ggplot2::element_text(size = 9),
-      legend.position = "right",
-      plot.margin = ggplot2::margin(6, 12, 6, 6),
+      axis.text.y = ggplot2::element_text(size = 9, lineheight = 0.9),      legend.position = "right",
+      plot.margin = ggplot2::margin(6, 12, 6, getOption("csn_left_margin_pts", 160)),
+      
       plot.background  = ggplot2::element_rect(fill = "white", colour = NA),
       panel.background = ggplot2::element_rect(fill = "white", colour = NA)
     ) + ggplot2::coord_cartesian(clip = "off")
   
   n_path <- nlevels(df_long$pathway)
-  W <- max(8, length(present) * 0.45)
+  W <- max(8, length(present) * 0.45) + getOption("csn_ylabel_extra_width", 2.5)
   H <- max(6, n_path * 0.22)
   list(plot = p, width = W, height = H)
 }

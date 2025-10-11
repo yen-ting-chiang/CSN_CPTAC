@@ -5293,12 +5293,14 @@ csn_pairwise_correlation_one_ds <- function(
   
   # Tech PCs（前 2 個）；per-pair 會用 gate_tech_pcs() 依 predictor 篩
   tech_df <- NULL
-  pc <- try(stats::prcomp(t(Mimp), center = TRUE, scale. = TRUE), silent = TRUE)
-  if (!inherits(pc, "try-error") && !is.null(pc$x)) {
-    k <- min(2L, ncol(pc$x))
-    tech_df <- as.data.frame(pc$x[, seq_len(k), drop = FALSE])
-    colnames(tech_df) <- paste0("PC", seq_len(k))
-    rownames(tech_df) <- rownames(tech_df)  # sample names already in rownames(pc$x)
+  if (is.null(batch) && .use_no_batch_sva(ds_id)) {
+    pc <- try(stats::prcomp(t(Mimp), center = TRUE, scale. = TRUE), silent = TRUE)
+    if (!inherits(pc, "try-error") && !is.null(pc$x)) {
+      k <- min(2L, ncol(pc$x))
+      tech_df <- as.data.frame(pc$x[, seq_len(k), drop = FALSE])
+      colnames(tech_df) <- paste0("PC", seq_len(k))
+      rownames(tech_df) <- rownames(tech_df)  # sample names already in rownames(pc$x)
+    }
   }
   
   # 兩兩配對
