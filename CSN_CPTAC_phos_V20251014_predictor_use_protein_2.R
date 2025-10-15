@@ -1193,7 +1193,7 @@ meta_fdr_stouffer <- function(dataset_dirs,
                               strata = c("ALL","TP53_mutant","TP53_wild_type"),
                               stat_tags = c("GSEA_limma_t_cont","GSEA_spearman"),
                               groups = names(genesets_by_group),
-                              out_root     = if (is.null(COMBO_PREFIX)) "csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr")) {
+                              out_root     = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr")) {
   stopifnot(length(dataset_dirs) > 0)
   ## [EXCLUDE-FROM-META] 永久排除 lusc_cptac_2021（不論 combo）
   if (!is.null(names(dataset_dirs))) {
@@ -4035,9 +4035,15 @@ run_one_stratum <- function(ds_id, ds_dir, mat0_full, sample_keep, out_root, gen
   mat0 <- mat0_full[, keep, drop = FALSE]
   mx <- suppressWarnings(max(mat0, na.rm = TRUE))
   if (is.finite(mx) && mx > 100) mat0 <- log2(mat0 + 1)
-  ## [NEW] protein-level predictors matrix for CSN/predictors
-  prot0_full <- load_matrix_from_dataset_dir(ds_dir); prot0 <- prot0_full[, sam_keep, drop = FALSE]
+  ## [NEW] predictors 用 protein 矩陣（與 phospho 樣本對齊）
+  prot0_full <- load_matrix_from_dataset_dir(ds_dir)
+  # 只取與 phospho 有交集且同序的樣本
+  sam_keep <- intersect(colnames(mat0), colnames(prot0_full))
+  prot0 <- prot0_full[, sam_keep, drop = FALSE]
   mat0  <- mat0[,  sam_keep, drop = FALSE]
+  # 若 protein 尚未 log2，與 protein pipeline 一致地轉換
+  mxp <- suppressWarnings(max(prot0, na.rm = TRUE))
+  if (is.finite(mxp) && mxp > 100) prot0 <- log2(prot0 + 1)
   
   ## 2) limma 用的插補+過濾矩陣（Spearman 仍用 raw mat0） + CSN_SCORE 可行性稽核
   mat  <- impute_and_filter(mat0, min_frac = min_frac_complete)
@@ -4075,15 +4081,8 @@ run_one_stratum <- function(ds_id, ds_dir, mat0_full, sample_keep, out_root, gen
     sa_all_limma <- sa_all[, keep_cols, drop = FALSE]
   }
   
-  ## [NEW] predictors 用 protein 矩陣（與 phospho 樣本對齊）
-  prot0_full <- load_matrix_from_dataset_dir(ds_dir)
-  # 只取與 phospho 有交集且同序的樣本；其餘交由下游對齊
-  sam_keep <- intersect(colnames(mat0), colnames(prot0_full))
-  prot0 <- prot0_full[, sam_keep, drop = FALSE]
-  mat0  <- mat0[,  sam_keep, drop = FALSE]
-  # 若 protein 尚未 log2，這裡與 protein pipeline 一致地轉換
-  mxp <- suppressWarnings(max(prot0, na.rm = TRUE))
-  if (is.finite(mxp) && mxp > 100) prot0 <- log2(prot0 + 1)
+  ## [MOVED] predictors 對齊區塊已前移至本函式開頭附近，避免 sam_keep 尚未定義的錯誤
+  
   
   ## 4) 逐「預測向量」執行分析：subunit 原值、CSN_SCORE、RESIDUAL_<SU>
   {
@@ -5157,7 +5156,7 @@ try(tp53_delta_nes_aggregate(
 .it_ds      <- "brca_cptac_2020"
 .it_version <- "BatchAdj"
 .it_group   <- "H"
-.it_stratum <- "TP53_mutant"
+.it_stratum <- "ALL"
 .it_pipes   <- c("limma_t")
 
 if (!is.null(dataset_dirs_run[[.it_ds]])) {
@@ -7010,7 +7009,7 @@ run_gsea_heatmaps_for_all_datasets(
 
 
 summarize_meta_fdr_across_subunits <- function(
-    meta_root = if (is.null(COMBO_PREFIX)) "csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr"),
+    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
     strata    = c("ALL","TP53_mutant","TP53_wild_type"),
     versions  = c("RAW","BatchAdj"),
     genesets_by_group = genesets_by_group,
@@ -7041,7 +7040,7 @@ summarize_meta_fdr_across_subunits <- function(
 ## ---- 一鍵執行（不重跑 GSEA；僅讀既有 *_meta_fdr.csv 後彙整）----
 posthoc_summary_meta_fdr <- function(){
   summarize_meta_fdr_across_subunits(
-    meta_root = if (is.null(COMBO_PREFIX)) "csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr"),
+    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
     strata           = c("ALL","TP53_mutant","TP53_wild_type"),
     versions         = c("RAW","BatchAdj"),
     genesets_by_group = genesets_by_group,
@@ -7071,7 +7070,7 @@ posthoc_summary_meta_fdr()
 
 posthoc_summary_meta_fdr_interaction <- function(){
   summarize_meta_fdr_across_subunits(
-    meta_root = if (is.null(COMBO_PREFIX)) "csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr"),
+    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
     strata            = c("ALL","TP53_mutant","TP53_wild_type"),
     versions          = c("RAW","BatchAdj"),
     genesets_by_group = genesets_by_group,
@@ -7455,7 +7454,7 @@ if (!exists(".pred_order_all", mode = "any")) {
 }
 
 # 找到四種目標 CSV（只抓 group=H 的 ALL / MUT / WT，且檔名完全匹配）
-.meta_find_target_csvs <- function(root = "csn_gsea_pan_summary_TP53/meta_fdr/summary") {
+.meta_find_target_csvs <- function(root = "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary") {
   if (!dir.exists(root)) return(character(0))
   pat_all_t <- "^Summary_.+_GSEA_limma_t_cont_meta_fdr_ALL\\.csv$"
   pat_all_i <- "^Summary_.+_GSEA_limma_interaction_meta_fdr_ALL\\.csv$"
@@ -7554,7 +7553,7 @@ if (!exists(".parse_meta_from_path", mode = "function")) {
 
 
 # 主程式：對找到的 meta_fdr Summary 檔畫圖，並產生 ordered 版本（依 ALL/t_cont）
-run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "csn_gsea_pan_summary_TP53/meta_fdr/summary" else file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr/summary")) {
+run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary")) {
   csvs <- .meta_find_target_csvs(root)
   ## [NEW] 篩選要畫的 collections（PAN 熱圖）
   .cols_pan <- get0("PLOT_PAN_COLLECTIONS", ifnotfound = NULL)
@@ -7693,7 +7692,7 @@ run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "csn_gsea_pa
 ## ---- 執行（例）----
 run_meta_fdr_heatmaps(
   root = if (is.null(COMBO_PREFIX)) 
-    "csn_gsea_pan_summary_TP53/meta_fdr/summary" 
+    "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary" 
   else 
-    file.path(COMBO_PREFIX, "csn_gsea_pan_summary_TP53/meta_fdr/summary")
+    file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary")
 )
