@@ -8481,6 +8481,35 @@ posthoc_summary_meta_fdr_DEG()
   )
 }
 
+
+# [NEW] 匯出熱圖用之完整數據（寬表：每列=gene；欄=各 predictor 的 Z_* 與 padj_meta_*）
+.deg_meta_write_data_csv <- function(csv_file, gene_set, out_csv, predictor_order = .pred_order_meta) {
+  df <- suppressMessages(.read_csv_safe(csv_file))
+  
+  # 自動偵測 pathway 欄位並統一為 pathway
+  path_candidates <- c("pathway","Pathway","term","Term","gs_name","NAME","set","Set")
+  path_col <- intersect(path_candidates, names(df))[1]
+  if (is.na(path_col)) stop("[deg-heatmap] 數據匯出失敗：找不到 pathway 欄位於: ", csv_file)
+  df <- dplyr::rename(df, pathway = dplyr::all_of(path_col))
+  
+  # 僅保留 geneset 與檔案有交集的基因（「所有 geneset 基因」的交集，而非只有熱圖 y 軸）
+  df <- dplyr::filter(df, .data$pathway %in% unique(gene_set))
+  if (!nrow(df)) stop("[deg-heatmap] 數據匯出失敗：geneset 與檔案無交集：", csv_file)
+  
+  # 依實際存在之 Z_* 欄位，決定順序；並為缺失之 padj_meta_* 欄補 NA
+  z_present <- intersect(predictor_order, grep("^Z_", names(df), value = TRUE))
+  keys <- sub("^Z_", "", z_present)
+  padj_need <- paste0("padj_meta_", keys)
+  missing_p <- setdiff(padj_need, names(df))
+  for (nm in missing_p) df[[nm]] <- NA_real_
+  
+  # 匯出欄位：pathway + 所有 Z_*（依順序）+ 對應的 padj_meta_*
+  out <- dplyr::select(df, dplyr::all_of(c("pathway", z_present, padj_need)))
+  readr::write_csv(out, out_csv)
+  message(sprintf("[deg-heatmap] 已輸出數據：%s（rows=%d, cols=%d）", out_csv, nrow(out), ncol(out)))
+}
+
+
 # -- 主程式：依指定 geneset 名稱清單與 pass 版本，畫 ALL/MUT/WT（含 ALL-ordered）
 
 # -- 自動偵測 DEG pan-summary 根目錄（支援未設定 COMBO_PREFIX）
@@ -8583,6 +8612,12 @@ run_deg_geneset_heatmaps <- function(
       base_all <- .deg_meta_out_base(csv_all, gs, "ALL", ver, suffix = "")
       .save_multi_formats(h_all$plot, base_all, h_all$width, h_all$height, formats = formats)
       message(sprintf("[deg-heatmap] 已輸出：%s.{%s}", base_all, paste(unique(tolower(formats)), collapse=",")))
+      # [NEW] 匯出 ALL 對應熱圖的完整數據（所有 genes × 所有 predictors）
+      .deg_meta_write_data_csv(
+        csv_file = csv_all, gene_set = genes,
+        out_csv  = paste0(base_all, "_data.csv"),
+        predictor_order = .pred_order_meta
+      )
       
       ## --- B) TP53_mutant：自家排序版 + ALL-ordered 版 ---
       if (!is.na(csv_mut)) {
@@ -8593,6 +8628,12 @@ run_deg_geneset_heatmaps <- function(
         .save_multi_formats(h_mut_self$plot, base_mut_self, h_mut_self$width, h_mut_self$height,
                             formats = formats)
         message(sprintf("[deg-heatmap] 已輸出：%s.{%s}", base_mut_self, paste(unique(tolower(formats)), collapse=",")))
+        # [NEW] 匯出 TP53_mutant（自家排序）對應熱圖的完整數據
+        .deg_meta_write_data_csv(
+          csv_file = csv_mut, gene_set = genes,
+          out_csv  = paste0(base_mut_self, "_data.csv"),
+          predictor_order = .pred_order_meta
+        )
         
         # ALL-ordered（沿用 ALL 的選取名單＋順序）
         h_mut_allord <- .deg_meta_make_heatmap_plot_genes(csv_mut,
@@ -8601,7 +8642,12 @@ run_deg_geneset_heatmaps <- function(
         .save_multi_formats(h_mut_allord$plot, base_mut_allord, h_mut_allord$width, h_mut_allord$height,
                             formats = formats)
         message(sprintf("[deg-heatmap] 已輸出：%s.{%s}", base_mut_allord, paste(unique(tolower(formats)), collapse=",")))
-        
+        # [NEW] 匯出 TP53_mutant（ALL-ordered）對應熱圖的完整數據
+        .deg_meta_write_data_csv(
+          csv_file = csv_mut, gene_set = genes,
+          out_csv  = paste0(base_mut_allord, "_data.csv"),
+          predictor_order = .pred_order_meta
+        )
       }
       
       ## --- C) TP53_wild_type：自家排序版 + ALL-ordered 版 ---
@@ -8612,14 +8658,24 @@ run_deg_geneset_heatmaps <- function(
         .save_multi_formats(h_wt_self$plot, base_wt_self, h_wt_self$width, h_wt_self$height,
                             formats = formats)
         message(sprintf("[deg-heatmap] 已輸出：%s.{%s}", base_wt_self, paste(unique(tolower(formats)), collapse=",")))
-        
+        # [NEW] 匯出 TP53_wild_type（自家排序）對應熱圖的完整數據
+        .deg_meta_write_data_csv(
+          csv_file = csv_wt, gene_set = genes,
+          out_csv  = paste0(base_wt_self, "_data.csv"),
+          predictor_order = .pred_order_meta
+        )
         h_wt_allord <- .deg_meta_make_heatmap_plot_genes(csv_wt,
                                                          gene_keep = yinfo$keep, y_order = yinfo$order, palette = pal)
         base_wt_allord <- .deg_meta_out_base(csv_wt, gs, "TP53_wild_type", ver, suffix = "_ALLordered")
         .save_multi_formats(h_wt_allord$plot, base_wt_allord, h_wt_allord$width, h_wt_allord$height,
                             formats = formats)
         message(sprintf("[deg-heatmap] 已輸出：%s.{%s}", base_wt_allord, paste(unique(tolower(formats)), collapse=",")))
-        
+        # [NEW] 匯出 TP53_wild_type（ALL-ordered）對應熱圖的完整數據
+        .deg_meta_write_data_csv(
+          csv_file = csv_wt, gene_set = genes,
+          out_csv  = paste0(base_wt_allord, "_data.csv"),
+          predictor_order = .pred_order_meta
+        )
       }
     }
   }
@@ -8643,9 +8699,9 @@ run_deg_geneset_heatmaps(
                "HALLMARK_DNA_REPAIR","HALLMARK_G2M_CHECKPOINT",
                "HALLMARK_MYC_TARGETS_V1","HALLMARK_E2F_TARGETS",
                "HALLMARK_MYC_TARGETS_V2"
-               ),
+  ),
   root     = if (is.null(COMBO_PREFIX)) "csn_deg_pan_summary_TP53/meta_fdr/summary"
-             else file.path(COMBO_PREFIX, "csn_deg_pan_summary_TP53/meta_fdr/summary"),
+  else file.path(COMBO_PREFIX, "csn_deg_pan_summary_TP53/meta_fdr/summary"),
   versions = getOption("csn.run_passes", c("BatchAdj")),  # 或 c("RAW","BatchAdj")
   top_n    = get0("PAN_HEATMAP_TOP_N", ifnotfound = 25L),
   bottom_n = get0("PAN_HEATMAP_BOTTOM_N", ifnotfound = 25L),
