@@ -159,6 +159,21 @@ options(csn.run_passes = RUN_PASSES)
 options(csn.run_camera_mroast = RUN_CAMERA_MROAST)
 ## ---- [END USER CONFIG] ----
 
+##COMBO_MODE <- "combo_1"
+COMBO_MODE <- "combo_2"
+##COMBO_MODE <- "combo_3"
+
+## ---- [NEW | DPS config] ----
+## 只跑 DPS（不執行 PTM-SEA）時請設 TRUE
+RUN_DPS_ONLY <- TRUE
+RUN_DPS_ONLY <- get0("RUN_DPS_ONLY", ifnotfound = FALSE)
+
+## DPS 專屬 combo 前綴：依你現有 COMBO_MODE 命名為「phospho_<combo>_ DPS」
+## （注意：底線後保留一個空白，完全依你訊息中的命名）
+COMBO_PREFIX_DPS <- if (!is.null(COMBO_MODE)) sprintf("phospho_%s_ DPS", COMBO_MODE) else NULL
+## ---- [END NEW | DPS config] ----
+
+
 ## ---- [USER CONFIG | heatmap top/bottom limits] ----
 ## 非 H 的 collection 熱圖篩選門檻（單一 dataset 用 NES，PAN 用 Z；皆以 CSN_SCORE 為篩選依據）
 ## - 單一 dataset：只保留 padj<0.05 的 NES 前 N 大與前 M 小（依 CSN_SCORE）
@@ -287,6 +302,177 @@ if (!is.null(df0) && NROW(df0) > 0) {
 }
 
 genesets_by_group <- list()
+
+Sys.setenv(PTMSIGDB_GMT = "C:/Users/danny/Documents/R_project/CSN_CPTAC/ptm.sig.db.all.uniprot.human.v2.0.0.gmt")
+
+## ---- [NEW | PTMsigDB helper for site-level PTM-SEA] ----
+.std_site_id <- function(x){
+  # 規格化成 GENE_S123 / GENE_T123 / GENE_Y123
+  x <- toupper(as.character(x))
+  x <- gsub("[:\\s]", "_", x)                    # 換成底線
+  x <- gsub("_([STY])(\\d+)[A-Z]*$", "_\\1\\2", x) # 去尾碼小寫或其他字尾
+  x
+}
+
+# 從 CPTAC phospho 標註產生位點 ID；優先用 NAME，否則 GENE + PHOSPHOSITES
+.make_site_id <- function(gene, name, phosphosites){
+  gene         <- as.character(gene)
+  name         <- as.character(name)
+  phosphosites <- as.character(phosphosites)
+  
+  row_fun <- function(g, n, p){
+    cand <- NA_character_
+    if (!is.na(n) && nzchar(n) && grepl("_[STY]\\d+", n, ignore.case = TRUE)) cand <- n
+    if (is.na(cand) || !nzchar(cand)) {
+      ps <- NA_character_
+      if (!is.na(p) && nzchar(p)) {
+        m <- regmatches(p, regexpr("([STY])(\\d+)", p, ignore.case = TRUE))
+        if (length(m) == 1 && nzchar(m)) ps <- m
+      }
+      if (!is.na(g) && nzchar(g) && !is.na(ps) && nzchar(ps)) cand <- paste0(g, "_", ps)
+    }
+    .std_site_id(cand)
+  }
+  
+  vapply(seq_along(gene), function(i) row_fun(gene[i], name[i], phosphosites[i]), character(1))
+}
+
+# 以可用欄位自動推斷 GENE_SITE：
+# 1) 若 NAME 含 GENE_S/T/Y###（允許後面接 :isoform）→ 用 NAME（去掉冒號之後）
+# 2) 否則若有 GENE_SYMBOL + PHOSPHOSITES/PHOSPHOSITE → 組合成 GENE_SITE
+# 3) 否則從 ENTITY_STABLE_ID 解析（支援 AAAS_pS495、AAAS_S495:NP_... 等）
+.infer_site_id <- function(df){
+  g   <- if ("GENE_SYMBOL"     %in% names(df)) as.character(df$GENE_SYMBOL)     else rep(NA_character_, nrow(df))
+  nm  <- if ("NAME"            %in% names(df)) as.character(df$NAME)            else rep(NA_character_, nrow(df))
+  p1  <- if ("PHOSPHOSITES"    %in% names(df)) as.character(df$PHOSPHOSITES)    else rep(NA_character_, nrow(df))
+  p2  <- if ("PHOSPHOSITE"     %in% names(df)) as.character(df$PHOSPHOSITE)     else rep(NA_character_, nrow(df))
+  ent <- if ("ENTITY_STABLE_ID" %in% names(df)) as.character(df$ENTITY_STABLE_ID) else rep(NA_character_, nrow(df))
+  
+  # 1) from NAME
+  id_from_name <- ifelse(!is.na(nm) & grepl("_[STY]\\d+", nm, ignore.case = TRUE),
+                         sub(":.*$", "", nm), NA_character_)
+  
+  # helper: 抓出第一個位點 token（S/T/Y + 數字）
+  site_token <- function(x){
+    y <- NA_character_
+    if (!is.na(x) && nzchar(x)) {
+      m <- regmatches(x, regexpr("([STY])(\\d+)", x, ignore.case = TRUE))
+      if (length(m) == 1 && nzchar(m)) y <- toupper(m)
+    }
+    y
+  }
+  
+  # 2) from GENE + (PHOSPHOSITES/PHOSPHOSITE)
+  ps <- vapply(seq_along(p1), function(i){
+    s <- if (!is.na(p1[i]) && nzchar(p1[i])) p1[i] else p2[i]
+    site_token(s)
+  }, character(1))
+  id_from_gp <- ifelse(!is.na(g) & nzchar(g) & !is.na(ps) & nzchar(ps),
+                       paste0(g, "_", ps), NA_character_)
+  
+  # 3) from ENTITY_STABLE_ID
+  ent_base <- toupper(sub(":.*$", "", ent))
+  ent_gene <- ifelse(!is.na(g) & nzchar(g), toupper(g), sub("_.*$", "", ent_base))
+  ent_site <- vapply(ent_base, function(x){
+    m <- regmatches(x, regexpr("([STY])(\\d+)", x, ignore.case = TRUE))
+    if (length(m) == 1 && nzchar(m)) toupper(m) else NA_character_
+  }, character(1))
+  id_from_ent <- ifelse(!is.na(ent_gene) & nzchar(ent_gene) & !is.na(ent_site) & nzchar(ent_site),
+                        paste0(ent_gene, "_", ent_site), NA_character_)
+  
+  # 依序回填
+  cand <- id_from_name
+  need <- is.na(cand) | !nzchar(cand)
+  cand[need] <- id_from_gp[need]
+  need <- is.na(cand) | !nzchar(cand)
+  cand[need] <- id_from_ent[need]
+  
+  .std_site_id(cand)
+}
+
+# 讀 PTMsigDB GMT（每列：<set>\t<desc>\t<site1>\t<site2>...）
+read_ptmsigdb_gmt <- function(fp) {
+  if (missing(fp) || !nzchar(fp) || !file.exists(fp)) {
+    stop("[PTMsigDB] 檔案不存在：", fp %||% "<empty>")
+  }
+  
+  std_id <- function(x) {
+    # 與你現有的 .std_site_id 一致的標準化：保留 GENE_SITE 格式
+    x <- toupper(trimws(x))
+    x <- sub(":.*$", "", x)              # 去掉 PMID 等附註（:右邊）
+    x <- gsub("[^A-Z0-9_]", "", x)       # 保守清理
+    x
+  }
+  
+  # ---- A) 若是 .xlsx（含 site.annotation 欄）→ 直接用 gene-symbol_site ----
+  if (grepl("\\.xlsx$", fp, ignore.case = TRUE)) {
+    if (!requireNamespace("readxl", quietly = TRUE)) {
+      stop("[PTMsigDB] 需要套件 readxl 來讀 .xlsx")
+    }
+    df <- readxl::read_xlsx(fp)
+    req <- c("signature", "site.annotation")
+    if (!all(req %in% names(df))) {
+      stop("[PTMsigDB] .xlsx 缺少必要欄位：", paste(setdiff(req, names(df)), collapse = ", "))
+    }
+    # site.annotation 形如：PPP1R12A_T696:15226371;20801872
+    df$gene_site <- std_id(df$site.annotation)
+    by_sig <- split(df$gene_site, df$signature)
+    out <- lapply(by_sig, function(v) unique(v[nzchar(v)]))
+    out[lengths(out) == 0] <- NULL
+    return(out)
+  }
+  
+  # ---- B) 若是 .gmt → 相容兩種常見格式 ----
+  lines <- readr::read_lines(fp)
+  res <- vector("list", length(lines))
+  nm  <- character(length(lines))
+  
+  for (i in seq_along(lines)) {
+    fields <- strsplit(lines[i], "\t", fixed = TRUE)[[1]]
+    if (length(fields) < 2) next
+    sig <- fields[1]; nm[i] <- sig
+    
+    # 正常 GMT：第 3 欄開始為各 site；有些變體把 gene-symbol 列在第 2 欄，以 '|' 分隔
+    toks <- if (length(fields) >= 3) fields[-(1:2)] else character(0)
+    if (length(toks) == 0 && grepl("\\|", fields[2], fixed = TRUE)) {
+      t2 <- strsplit(fields[2], "\\|")[[1]]
+      toks <- t2[!grepl("^n=\\d+$", t2, ignore.case = TRUE)]
+    }
+    
+    # 去掉註解部分（:右側，例如 PMID 串），標準化
+    toks <- std_id(toks)
+    
+    # 只保留 gene-symbol_site 形態（GENE_[STY]pos）
+    keep <- grepl("^[A-Z0-9._-]+_[STY][0-9]+$", toks)
+    toks <- unique(toks[keep & nzchar(toks)])
+    
+    res[[i]] <- toks
+  }
+  
+  names(res) <- nm
+  res[lengths(res) == 0] <- NULL
+  # 若全部空，通常代表這份 GMT 是 **UniProt;位點**（如 O14974;T696），請改用 .xlsx 或 gene 版 GMT
+  if (!length(res)) {
+    stop("[PTMsigDB] 解析結果為空。這份 GMT 很可能是 UniProt 版（如 O14974;T696）。",
+         " 請改用帶 gene-symbol 的來源（.xlsx 或 gene 版 GMT）。")
+  }
+  res
+}
+
+
+# 使用方式：把環境變數 PTMSIGDB_GMT 指向 PTMsigDB 的 site-level GMT
+Sys.setenv(PTMSIGDB_GMT = "C:/Users/danny/Documents/R_project/CSN_CPTAC/data_PTMsigDB_all_sites_v2.0.0.xlsx")
+
+PTMSIGDB_GMT_FP <- Sys.getenv("PTMSIGDB_GMT", unset = "")
+genesets_by_group_ptm <- list()
+if (nzchar(PTMSIGDB_GMT_FP) && file.exists(PTMSIGDB_GMT_FP)) {
+  genesets_by_group_ptm[["PTMsigDB"]] <- read_ptmsigdb_gmt(PTMSIGDB_GMT_FP)
+  log_msg("已載入 PTMsigDB site collections：%d sets", length(genesets_by_group_ptm[["PTMsigDB"]]))
+} else {
+  log_msg("（提醒）尚未設定 PTMSIGDB_GMT；位點層級 PTM-SEA 將無法執行。")
+}
+## ---- [END NEW] ----
+
 
 .get_subcat_col <- function(df){
   cand <- c("gs_subcollection", "gs_subcat", "gs_subcategory", "subcategory", "sub_category")
@@ -1277,7 +1463,7 @@ meta_fdr_stouffer <- function(dataset_dirs,
           
           # 1) 找出所有 subunit（以各 dataset 的資料夾 union）
           subunits <- unique(unlist(lapply(dataset_dirs, function(dsdir) {
-            base <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection",
+            base <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection,
                               safe_fs_name(grp), pass_label, basename(dsdir), stratum)
             if (!dir.exists(base)) return(character(0))
             # 只列最上層子目錄名（每一個 subunit）
@@ -1295,7 +1481,7 @@ meta_fdr_stouffer <- function(dataset_dirs,
           for (su in subunits) {
             parts <- list()
             for (dsdir in dataset_dirs) {
-              f <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection",
+              f <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection,
                              safe_fs_name(grp), pass_label, basename(dsdir), stratum, su,
                              sprintf("%s.csv", stat_tag))
               if (!file.exists(f)) next
@@ -1920,9 +2106,7 @@ dataset_ids <- c(
 )
 
 
-##COMBO_MODE <- "combo_1"
-COMBO_MODE <- "combo_2"
-##COMBO_MODE <- "combo_3"
+
 
 
 ## ---- [NEW | COMBO PRESETS: choose one] ----
@@ -2298,6 +2482,10 @@ load_phospho_matrix_from_dataset_dir <- function(dir,
 }
 
 .run_limma_t_and_gsea <- function(M, DF, coef_name, genesets, out_prefix, minSize = 15L, maxSize = 500L, fgsea_eps = 0) {
+  if (is.null(M) || !is.matrix(M) || nrow(M) < 2) {
+    if (exists("log_msg")) log_msg("[limma] 略過：輸入矩陣無可用特徵（nrow=%s）", ifelse(is.null(M), "NULL", as.character(nrow(M))))
+    return(invisible(NULL))
+  }
   if (is.null(M) || is.null(DF)) return(invisible(NULL))
   if (!ncol(M) || !nrow(M)) return(invisible(NULL))
   
@@ -2392,7 +2580,7 @@ load_phospho_matrix_from_dataset_dir <- function(dir,
     use_sva <- tryCatch({
       exists(".use_no_batch_sva", mode = "function") && .use_no_batch_sva(ds_id)
     }, error = function(e) FALSE)
-    if (use_sva && !is.null(mat_for_sv)) {
+    if (is.null(batch_all) && use_sva && !is.null(mat_for_sv)) {
       # 估 SV：與你現行 estimate_svs 一致
       sv_cols <- tryCatch({
         sv_res <- estimate_svs(M = as.matrix(mat_for_sv[, sample_order, drop = FALSE]),
@@ -2406,15 +2594,23 @@ load_phospho_matrix_from_dataset_dir <- function(dir,
       }
     } else {
       # 後備：tech PCs
-      if (!is.null(mat_for_sv)) {
+      if (is.null(batch_all) && !is.null(mat_for_sv)) {
         tech_df <- try(build_tech_covars(as.matrix(mat_for_sv[, sample_order, drop = FALSE])), silent = TRUE)
         if (!inherits(tech_df, "try-error") && !is.null(tech_df)) {
           tech_df <- as.data.frame(tech_df, check.names = FALSE)
-          # 自動移除零變異欄
-          keep <- vapply(tech_df, function(v) stats::var(v, na.rm = TRUE) > 0, logical(1))
-          if (any(keep)) {
-            tech_df <- tech_df[, keep, drop = FALSE]
-            for (cn in colnames(tech_df)) DF[[cn]] <- as.numeric(tech_df[, cn])
+          # 自動移除零變異欄（避免與外層 keep 名稱衝突；且用明確欄位索引）
+          .nzv_cols <- vapply(tech_df, function(v) {
+            vv <- suppressWarnings(as.numeric(v))
+            isTRUE(stats::var(vv, na.rm = TRUE) > 0)
+          }, logical(1))
+          .idx <- which(.nzv_cols)
+          if (length(.idx)) {
+            tech_df <- tech_df[, .idx, drop = FALSE]
+            # 欄名保險：若缺欄名則自動補上
+            if (is.null(colnames(tech_df)) || any(!nzchar(colnames(tech_df)))) {
+              colnames(tech_df) <- paste0("PC", seq_len(ncol(tech_df)))
+            }
+            for (cn in colnames(tech_df)) DF[[cn]] <- as.numeric(tech_df[[cn]])
           }
         }
       }
@@ -2440,10 +2636,6 @@ run_imputation_test <- function(ds_id,
   
   # 載入矩陣（延續你現有載入/對數轉換邏輯）
   mat0_full   <- load_phospho_matrix_from_dataset_dir(ds_dir, protein_adjust = TRUE)
-  if (exists("log_msg")) {
-    log_msg("[imputation_test] protein_adjusted = %s",
-            if (isTRUE(attr(mat0_full, "protein_adjusted"))) "TRUE" else "FALSE")
-  }
   keep <- colnames(mat0_full)
   mat0 <- mat0_full[, keep, drop = FALSE]
   mx <- suppressWarnings(max(mat0, na.rm = TRUE))
@@ -3605,7 +3797,7 @@ run_predictor_analyses <- function(
           if (!is.null(stats_raw_sp) && length(stats_raw_sp) && any(is.finite(stats_raw_sp))) {
             run_and_write_gsea_spearman(
               stats_raw_sp, pw, grp,
-              out_dir_root = file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "RAW", ds_id, basename(out_root)),
+              out_dir_root = file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "RAW", ds_id, basename(out_root)),
               subunit      = predictor_name,
               pass_label   = "RAW"
             )
@@ -3625,7 +3817,7 @@ run_predictor_analyses <- function(
           )
           run_and_write_gsea_spearman(
             stats_ba_sp, pw, grp,
-            out_dir_root = file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root)),
+            out_dir_root = file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root)),
             subunit      = predictor_name,
             pass_label   = "BatchAdj"
           )
@@ -3671,7 +3863,7 @@ run_predictor_analyses <- function(
                 for (grp in names(genesets_by_group)) {
                   pw <- genesets_by_group[[grp]]
                   if (is.null(pw) || !length(pw)) next
-                  out_dir_int_raw <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "RAW", ds_id, basename(out_root), predictor_name)
+                  out_dir_int_raw <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "RAW", ds_id, basename(out_root), predictor_name)
                   dir.create(out_dir_int_raw, recursive = TRUE, showWarnings = FALSE)
                   
                   # ---- 互動：fgsea/camera/mroast ----
@@ -3720,7 +3912,7 @@ run_predictor_analyses <- function(
               for (grp in names(genesets_by_group)) {
                 pw <- genesets_by_group[[grp]]
                 if (is.null(pw) || !length(pw)) next
-                out_dir_int_raw <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "RAW", ds_id, basename(out_root), predictor_name)
+                out_dir_int_raw <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "RAW", ds_id, basename(out_root), predictor_name)
                 dir.create(out_dir_int_raw, recursive = TRUE, showWarnings = FALSE)
                 
                 idx2 <- limma::ids2indices(pw, names(z_diff), remove.empty = TRUE)
@@ -3758,7 +3950,7 @@ run_predictor_analyses <- function(
             for (grp in names(genesets_by_group)) {
               pw <- genesets_by_group[[grp]]
               if (is.null(pw) || !length(pw)) next
-              out_dir_int_ba <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root), predictor_name)
+              out_dir_int_ba <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root), predictor_name)
               dir.create(out_dir_int_ba, recursive = TRUE, showWarnings = FALSE)
               
               # ---- 互動：fgsea/camera/mroast ----
@@ -3802,7 +3994,7 @@ run_predictor_analyses <- function(
               for (grp in names(genesets_by_group)) {
                 pw <- genesets_by_group[[grp]]
                 if (is.null(pw) || !length(pw)) next
-                out_dir_int_ba <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root), predictor_name)
+                out_dir_int_ba <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp), "BatchAdj", ds_id, basename(out_root), predictor_name)
                 dir.create(out_dir_int_ba, recursive = TRUE, showWarnings = FALSE)
                 
                 idx2 <- limma::ids2indices(pw, names(z_diff), remove.empty = TRUE)
@@ -3862,9 +4054,9 @@ run_predictor_analyses <- function(
       pw <- genesets_by_group[[grp_name]]
       
       ## [NEW] collection-first root: <collection>/<dataset>/<stratum>/<RAW|BatchAdj>/<predictor>
-      out_root_coll <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), ds_id, basename(out_root))
+      out_root_coll <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), ds_id, basename(out_root))
       if ("RAW" %in% getOption("csn.run_passes", c("BatchAdj"))) {
-        out_dir_A1 <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), "RAW", ds_id, basename(out_root), predictor_name)
+        out_dir_A1 <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), "RAW", ds_id, basename(out_root), predictor_name)
         dir.create(out_dir_A1, recursive = TRUE, showWarnings = FALSE)
         fit1 <- limma::eBayes(limma::lmFit(M_raw, des_raw))
         t1 <- fit1$t[, coef_name(des_raw)]
@@ -3885,7 +4077,7 @@ run_predictor_analyses <- function(
       
       ## A2
       if ("BatchAdj" %in% getOption("csn.run_passes", c("BatchAdj"))) {
-        out_dir_A2 <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), "BatchAdj", ds_id, basename(out_root), predictor_name)
+        out_dir_A2 <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), "BatchAdj", ds_id, basename(out_root), predictor_name)
         dir.create(out_dir_A2, recursive = TRUE, showWarnings = FALSE)
         fit2 <- limma::eBayes(limma::lmFit(M_ba, des_ba))
         t2 <- fit2$t[, coef_name(des_ba)]
@@ -4201,8 +4393,8 @@ run_one_stratum <- function(ds_id, ds_dir, mat0_full, sample_keep, out_root, gen
   
   # RAW：limma_t_cont + interaction（只彙整現有 csv，不重跑）
   for (grp_name in names(genesets_by_group)) {
-    out_root_coll <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), ds_id, basename(out_root))
-    ver_root <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), "RAW", ds_id, basename(out_root))
+    out_root_coll <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), ds_id, basename(out_root))
+    ver_root <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), "RAW", ds_id, basename(out_root))
     summarize_all_groups(
       out_root = ver_root,
       csn_subunits = sum_units,
@@ -4214,8 +4406,8 @@ run_one_stratum <- function(ds_id, ds_dir, mat0_full, sample_keep, out_root, gen
   
   # BatchAdj：limma_t_cont + spearman + interaction（只彙整現有 csv，不重跑）
   for (grp_name in names(genesets_by_group)) {
-    out_root_coll <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), ds_id, basename(out_root))
-    ver_root <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), "BatchAdj", ds_id, basename(out_root))
+    out_root_coll <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), ds_id, basename(out_root))
+    ver_root <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(grp_name), "BatchAdj", ds_id, basename(out_root))
     summarize_all_groups(
       out_root = ver_root,
       csn_subunits = sum_units,
@@ -4923,7 +5115,7 @@ run_mroast_save <- function(expr_mat, design, coef_or_contrast, pathways, out_di
 }
 
 ## ===== DO_AUDIT 開關包住 QC/探索（4）=====
-DO_AUDIT <- TRUE  # <— 預設關閉；需要時改 TRUE
+DO_AUDIT <- FALSE  # <— 預設關閉；需要時改 TRUE
 
 if (DO_AUDIT) {
   results <- list()
@@ -4982,10 +5174,94 @@ options(csn.audit_sva_sanity = FALSE)  # 想關掉就設 FALSE
 }
 
 
+# --- [NEW | SITE-LEVEL] phospho 位點矩陣載入（保留 site；可做蛋白校正） ---
+load_phosphosite_matrix_from_dataset_dir <- function(ds_dir,
+                                                     protein_adjust = TRUE,
+                                                     min_nonNA_row_frac = 0) {
+  fp <- file.path(ds_dir, "data_phosphoprotein_quantification.txt")
+  if (!file.exists(fp)) stop("找不到 phosphoprotein 檔：", fp)
+  log_msg("讀取 phospho（site-level）矩陣：data_phosphoprotein_quantification.txt")
+  
+  df <- suppressMessages(vroom::vroom(fp, delim = "\t", col_types = vroom::cols(.default = "d",
+                                                                                ENTITY_STABLE_ID = "c",
+                                                                                NAME = "c",
+                                                                                DESCRIPTION = "c",
+                                                                                GENE_SYMBOL = "c",
+                                                                                PHOSPHOSITES = "c", PHOSPHOSITE = "c")))
+  df <- as.data.frame(df, check.names = FALSE)
+  
+  # 偵測註解欄＋樣本欄
+  anno_cols <- intersect(c("ENTITY_STABLE_ID","NAME","DESCRIPTION","GENE_SYMBOL","PHOSPHOSITES","PHOSPHOSITE"), colnames(df))
+  samp_cols <- setdiff(colnames(df), anno_cols)
+  stopifnot(length(samp_cols) > 0)
+  
+  # 產生 site_id 並正規化
+  site_id <- .infer_site_id(df)
+  keep <- !is.na(site_id) & nzchar(site_id)
+  df  <- df[keep, , drop = FALSE]
+  site_id <- site_id[keep]
+  
+  M_site <- as.matrix(df[, samp_cols, drop = FALSE])
+  storage.mode(M_site) <- "numeric"
+  rownames(M_site) <- site_id
+  colnames(M_site) <- samp_cols
+  
+  # （可選）依最小非缺值比例過濾
+  if (min_nonNA_row_frac > 0) {
+    ok <- rowMeans(is.finite(M_site)) >= min_nonNA_row_frac
+    M_site <- M_site[ok, , drop = FALSE]
+  }
+  
+  # 蛋白校正：用對應基因的 protein abundance 做 subtract（site residual-like）
+  if (isTRUE(protein_adjust)) {
+    prot_fp <- file.path(ds_dir, "data_protein_quantification.txt")
+    if (!file.exists(prot_fp)) stop("[phospho-site] protein_adjust=TRUE 但找不到 protein 檔")
+    log_msg("位點層級蛋白校正：讀取 protein 矩陣：data_protein_quantification.txt")
+    
+    prot_df <- suppressMessages(vroom::vroom(prot_fp, delim = "\t"))
+    prot_df <- as.data.frame(prot_df, check.names = FALSE)
+    
+    # 嘗試找 protein gene 欄（與你先前做法一致）
+    gcol <- which(tolower(colnames(prot_df)) %in% tolower(c("Composite.Element.REF","Gene","GENE","GENE_SYMBOL","GENE_NAME")))[1]
+    if (is.na(gcol)) stop("[phospho-site] protein_adjust=TRUE 但 protein 檔缺 gene 欄")
+    prot_genes <- as.character(prot_df[[gcol]])
+    prot_mat   <- as.matrix(prot_df[, setdiff(colnames(prot_df), colnames(prot_df)[gcol]), drop = FALSE])
+    rownames(prot_mat) <- prot_genes
+    storage.mode(prot_mat) <- "numeric"
+    
+    # 由 site 對回 gene：直接用 .make_site_id 的 gene 輸入（df$GENE_SYMBOL 已齊）
+    # 這裡重算一次，只取 gene
+    gene_of_site <- as.character(df$GENE_SYMBOL)
+    gene_of_site <- gene_of_site[keep]
+    
+    # 對每個 site 減去對應 gene 的 protein 向量（以共通樣本為準）
+    common <- intersect(colnames(M_site), colnames(prot_mat))
+    if (length(common) >= 2) {
+      M_site <- M_site[, common, drop = FALSE]
+      prot_mat <- prot_mat[, common, drop = FALSE]
+      
+      # 向量化 subtract：用 split 索引避免逐 row 迴圈
+      idx <- match(gene_of_site, rownames(prot_mat))
+      hasp <- !is.na(idx)
+      if (any(hasp)) {
+        M_site[hasp, ] <- M_site[hasp, , drop = FALSE] - prot_mat[idx[hasp], , drop = FALSE]
+      }
+    } else {
+      log_msg("（警告）phospho 與 protein 樣本交集 < 2；略過蛋白校正")
+    }
+  }
+  
+  # 回傳「位點層級」矩陣（後續插補 / 批次校正在下游與基因層級一致處理）
+  M_site
+}
+# --- [END NEW] ---
+
+
+
 ## =========================================================
 ## 依序處理本輪要跑的 datasets（補齊主迴圈＋定義各分層樣本集）
 ## =========================================================
-for (ds in names(dataset_dirs_run)) {
+if (!isTRUE(RUN_DPS_ONLY)) for (ds in names(dataset_dirs_run)) {
   ds_dir <- dataset_dirs_run[[ds]]
   log_msg("== 開始資料集：%s ==", ds)
   
@@ -5004,10 +5280,6 @@ for (ds in names(dataset_dirs_run)) {
   
   ## 蛋白矩陣 & TP53 狀態
   mat0_full   <- load_phospho_matrix_from_dataset_dir(ds_dir, protein_adjust = TRUE)
-  if (exists("log_msg")) {
-    log_msg("[phospho] protein_adjusted = %s",
-            if (isTRUE(attr(mat0_full, "protein_adjusted"))) "TRUE" else "FALSE")
-  }
   tp53_status <- get_tp53_status(ds_dir, colnames(mat0_full))
   
   ## 三個分層的樣本集
@@ -5054,6 +5326,87 @@ for (ds in names(dataset_dirs_run)) {
 }
 
 
+## =========================================================
+## [NEW | SITE-LEVEL PTM-SEA] 依序處理 datasets（位點層級；PTMsigDB）
+## =========================================================
+if (!isTRUE(RUN_DPS_ONLY)) for (ds in names(dataset_dirs_run)) {
+  ds_dir <- dataset_dirs_run[[ds]]
+  log_msg("== [PTM-SEA | site-level] 開始資料集：%s ==", ds)
+  ## [SITE] 特例：LUSC 的 phospho 欄位結構不相容，site-level 一律跳過
+  if (identical(ds, "lusc_cptac_2021")) {
+    log_msg("[PTM-SEA] skip：%s（LUSC phospho 欄位結構不相容；site-level 不執行）", ds)
+    next
+  }
+  ## ---- RUN_PASSES（沿用 combo 規則，但輸出前綴改成 phospho_site_） ----
+  if (!is.null(COMBO_MODE)) {
+    if (COMBO_MODE == "combo_1") {
+      options(csn.run_passes = c("BatchAdj"))
+    } else if (COMBO_MODE == "combo_2") {
+      if (ds %in% .combo2_raw_ds) options(csn.run_passes = "RAW") else options(csn.run_passes = c("BatchAdj"))
+    } else if (COMBO_MODE == "combo_3") {
+      options(csn.run_passes = "RAW")
+    }
+    options(csn.run_camera_mroast = FALSE)
+  }
+  
+  ## 位點矩陣（已保留 site，不做基因彙總；並可做蛋白校正）
+  ## [SITE] 放寬非缺失率門檻（site 較稀疏，避免全被濾掉）
+  .old_min_frac_complete <- min_frac_complete; min_frac_complete <- 0.30
+  mat0_full_site <- load_phosphosite_matrix_from_dataset_dir(ds_dir, protein_adjust = TRUE)
+  
+  ## TP53 狀態（採樣本欄位）
+  tp53_status <- get_tp53_status(ds_dir, colnames(mat0_full_site))
+  samples_ALL <- colnames(mat0_full_site)
+  samples_MUT <- names(tp53_status)[tp53_status == "TP53_mutant"]
+  samples_WT  <- names(tp53_status)[tp53_status == "TP53_wild_type"]
+  
+  ## 輸出根目錄（site 版前綴）
+  base_tp53_root_site <- if (is.null(COMBO_MODE)) {
+    file.path(ds_dir, "phospho_site_csn_gsea_results_TP53")
+  } else {
+    file.path(sprintf("phospho_site_%s", COMBO_MODE), ds, "phospho_site_csn_gsea_results_TP53")
+  }
+  
+  ## genesets：使用 PTMsigDB（需先設定 PTMSIGDB_GMT 環境變數）
+  if (length(genesets_by_group_ptm) == 0) {
+    log_msg("[PTM-SEA] 未載入 PTMsigDB，略過資料集 %s", ds)
+    next
+  }
+  
+  if (.should_run("ALL")) {
+    run_one_stratum(
+      ds_id = ds, ds_dir = ds_dir,
+      mat0_full = mat0_full_site,
+      sample_keep = samples_ALL,
+      out_root = file.path(base_tp53_root_site, "ALL"),
+      genesets_by_group = genesets_by_group_ptm
+    )
+  }
+  if (.should_run("TP53_mutant")) {
+    run_one_stratum(
+      ds_id = ds, ds_dir = ds_dir,
+      mat0_full = mat0_full_site,
+      sample_keep = samples_MUT,
+      out_root = file.path(base_tp53_root_site, "TP53_mutant"),
+      genesets_by_group = genesets_by_group_ptm
+    )
+  }
+  if (.should_run("TP53_wild_type")) {
+    run_one_stratum(
+      ds_id = ds, ds_dir = ds_dir,
+      mat0_full = mat0_full_site,
+      sample_keep = samples_WT,
+      out_root = file.path(base_tp53_root_site, "TP53_wild_type"),
+      genesets_by_group = genesets_by_group_ptm
+    )
+  }
+  
+  ## [SITE] 還原全域門檻
+  min_frac_complete <- .old_min_frac_complete
+  log_msg("== [PTM-SEA | site-level] 完成資料集：%s（TP53 分層輸出 → %s）==", ds, base_tp53_root_site)
+}
+
+
 ## ---------- [NEW] WT vs MT ΔNES 聚合（從既有輸出彙整） ----------
 tp53_delta_nes_aggregate <- function(datasets_root,
                                      dataset_ids = NULL,
@@ -5069,8 +5422,8 @@ tp53_delta_nes_aggregate <- function(datasets_root,
     for (ver in versions) {
       # 自動偵測 subunits：讀 WT/MT 資料夾下的子目錄名稱
       subunits <- unique(unlist(lapply(groups, function(g){
-        b1 <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(g), ver, ds, "TP53_wild_type")
-        b2 <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(g), ver, ds, "TP53_mutant")
+        b1 <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(g), ver, ds, "TP53_wild_type")
+        b2 <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, safe_fs_name(g), ver, ds, "TP53_mutant")
         c(list.dirs(b1, full.names = FALSE, recursive = FALSE),
           list.dirs(b2, full.names = FALSE, recursive = FALSE))
       })))
@@ -5081,8 +5434,8 @@ tp53_delta_nes_aggregate <- function(datasets_root,
         for (grp in groups) {
           grp_safe <- safe_fs_name(grp)
           for (st in stat_tags) {
-            fp_wt <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", grp_safe, ver, ds, "TP53_wild_type", su, paste0(st, ".csv"))
-            fp_mt <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", grp_safe, ver, ds, "TP53_mutant", su, paste0(st, ".csv"))
+            fp_wt <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, grp_safe, ver, ds, "TP53_wild_type", su, paste0(st, ".csv"))
+            fp_mt <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, grp_safe, ver, ds, "TP53_mutant", su, paste0(st, ".csv"))
             if (!file.exists(fp_wt) || !file.exists(fp_mt)) next
             wt <- tryCatch(data.table::fread(fp_wt, na.strings=c("NA","NaN","")), error=function(e) NULL)
             mt <- tryCatch(data.table::fread(fp_mt, na.strings=c("NA","NaN","")), error=function(e) NULL)
@@ -5118,7 +5471,7 @@ tp53_delta_nes_aggregate <- function(datasets_root,
               ) |>
               dplyr::select(pathway, NES_WT, NES_MT, delta_NES, padj_WT, padj_MT, pval_WT, pval_MT, direction_consistency) |>
               dplyr::arrange(dplyr::desc(abs(delta_NES)), pathway)
-            out_dir <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", grp_safe, ver, ds, "DeltaWT_MT", su)
+            out_dir <- file.path(COMBO_PREFIX %||% phospho_site_csn_gsea_results_TP53_by_collection, grp_safe, ver, ds, "DeltaWT_MT", su)
             dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
             out_csv <- file.path(out_dir, paste0(st, "_deltaWTMT.csv"))
             data.table::fwrite(df, out_csv)
@@ -5132,18 +5485,200 @@ tp53_delta_nes_aggregate <- function(datasets_root,
 }
 
 ## =========================================================
-## [NEW-1] 產出跨資料集的 meta-FDR（Stouffer → BH）
-## 條件：上方 for 迴圈已全部完成且各資料集/分層/統計已落地
 ## =========================================================
-meta_fdr_stouffer(
-  dataset_dirs = dataset_dirs_run,                 # ← 用本輪實際跑過且可用的集合
-  strata       = strata,                           # c("ALL","TP53_mutant","TP53_wild_type")
-  stat_tags    = c("GSEA_limma_t_cont",
-                   "GSEA_spearman",
-                   "GSEA_limma_interaction"),      # ← 新增這一個
-  groups       = names(genesets_by_group),
-  out_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr")
+## [DPS-meta] 產出跨資料集的 Stouffer 合併結果 (DPS)
+## 條件：上方 for 迴圈(DPS)已全部完成且
+##       各 dataset / stratum / version / SU__*/DPS_results.csv
+##       都已寫到硬碟
+##
+## 結果輸出：
+##   <OUT_ROOT>/<STRATUM>/<VERSION>/<SUBUNIT>/DPS_meta_stouffer.csv
+##   其中：
+##     - site_id              (等同 PTM-SEA 的 pathway)
+##     - logFC_mean           (等同 PTM-SEA 的 NES 平均方向/大小感)
+##     - Z                    (Stouffer 合併 Z，方向用 logFC 正負)
+##     - p_meta, padj_meta    (BH 校正後的 meta FDR)
+##     - n_ds                 (有多少 dataset 貢獻這個 site)
+## =========================================================
+dps_meta_stouffer <- function(
+    dataset_dirs,
+    strata    = c("ALL","TP53_mutant","TP53_wild_type"),
+    versions  = c("RAW","BatchAdj"),
+    out_root  = if (is.null(COMBO_PREFIX_DPS))
+      "phospho_DPS_meta"
+    else
+      file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta")
+){
+  if (!requireNamespace("data.table", quietly = TRUE))
+    stop("請先安裝 data.table")
+  if (!requireNamespace("stats", quietly = TRUE))
+    stop("需要 stats")
+  
+  .safe_read_dps <- function(fp){
+    if (!file.exists(fp)) return(NULL)
+    dt <- tryCatch(
+      data.table::fread(fp, na.strings = c("NA","NaN","")),
+      error = function(e) NULL
+    )
+    if (is.null(dt) || !nrow(dt)) return(NULL)
+    
+    ## 舊版有可能把位點ID放在 ID 而不是 site_id
+    if (!"site_id" %in% names(dt) && "ID" %in% names(dt)) {
+      dt$site_id <- dt$ID
+    }
+    dt
+  }
+  
+  .combine_one_predictor <- function(tbl_list){
+    ## tbl_list: named list(dataset_id -> data.table with site_id, logFC, P.Value, adj.P.Val)
+    keep <- tbl_list[!vapply(tbl_list, is.null, logical(1))]
+    if (!length(keep)) return(NULL)
+    
+    long <- data.table::rbindlist(
+      lapply(names(keep), function(ds_nm){
+        x <- keep[[ds_nm]]
+        if (!all(c("site_id","logFC","P.Value","adj.P.Val") %in% names(x))) return(NULL)
+        data.table::data.table(
+          dataset = ds_nm,
+          site_id = x$site_id,
+          logFC   = as.numeric(x$logFC),
+          pval    = as.numeric(x$P.Value),
+          padj    = as.numeric(x$adj.P.Val)
+        )
+      }),
+      fill = TRUE
+    )
+    if (is.null(long) || !nrow(long)) return(NULL)
+    
+    ## 方向 = logFC 正負，大小 = 兩尾 p-value 轉成 z
+    long[, z_i := {
+      dirn <- sign(logFC)
+      zz   <- stats::qnorm(1 - pval/2)
+      dirn * zz
+    }]
+    
+    ## 依 site_id 合併成 meta
+    summ <- long[
+      , .(
+        n_ds       = sum(is.finite(z_i)),
+        Z          = if (sum(is.finite(z_i)) > 0) sum(z_i, na.rm = TRUE)/sqrt(sum(is.finite(z_i))) else NA_real_,
+        logFC_mean = mean(logFC, na.rm = TRUE),
+        pval_min   = suppressWarnings(min(pval, na.rm = TRUE)),
+        padj_min   = suppressWarnings(min(padj, na.rm = TRUE))
+      ),
+      by = .(site_id)
+    ]
+    
+    ## Z -> 兩尾 p，再做 BH 得到 meta FDR
+    summ[, p_meta := 2*stats::pnorm(-abs(Z))]
+    summ[, padj_meta := stats::p.adjust(p_meta, method = "BH")]
+    
+    ## 排序準則：
+    ## 1. padj_meta 由小到大（越顯著越前面）
+    ## 2. p_meta 由小到大
+    ## 3. |Z| 由大到小（方向強度）
+    ## 4. site_id 字母序
+    summ[, absZ := abs(Z)]
+    data.table::setorder(summ, padj_meta, p_meta, -absZ, site_id)
+    summ[, absZ := NULL]
+    
+    summ[]
+  }
+  
+  for (st in strata){
+    for (ver in versions){
+      
+      ## ------------------------------------------------------------------
+      ## 從所有 dataset 蒐集 subunit/predictor 目錄 (SU__*)，做聯集
+      ## 這樣就不會只看第一個 dataset，導致漏掉像 COPS3 / RESIDUAL_COPS3
+      ## ------------------------------------------------------------------
+      su_tags_all <- character(0)
+      
+      for (ds_nm in names(dataset_dirs)) {
+        probe_dir <- file.path(dataset_dirs[[ds_nm]], st, "DPS", ver)
+        if (!dir.exists(probe_dir)) next
+        
+        # 這裡用 full.names = FALSE，就直接拿到目錄名稱，例如 "SU__COPS1"
+        this_su_dirs <- list.dirs(probe_dir, full.names = FALSE, recursive = FALSE)
+        this_su_tags <- this_su_dirs[grepl("^SU__", this_su_dirs)]
+        if (length(this_su_tags)) {
+          su_tags_all <- union(su_tags_all, this_su_tags)
+        }
+      }
+      
+      ## 如果這個 stratum/version 在所有 dataset 都沒有任何 SU__*，就跳過
+      if (!length(su_tags_all)) next
+      
+      ## ------------------------------------------------------------------
+      ## 對每一個 predictor/subunit (e.g. SU__COPS1, SU__COPS3, SU__RESIDUAL_COPS3, ...)
+      ## 收集所有 dataset 的同名結果並做 Stouffer 合併
+      ## ------------------------------------------------------------------
+      for (su_tag in su_tags_all) {
+        su_name <- sub("^SU__","", su_tag)
+        
+        ## 收集所有 dataset 對同一個 predictor 的 DPS_results.csv
+        per_ds <- lapply(names(dataset_dirs), function(ds_nm){
+          fp <- file.path(
+            dataset_dirs[[ds_nm]],
+            st, "DPS", ver,
+            su_tag,
+            "DPS_results.csv"
+          )
+          .safe_read_dps(fp)
+        })
+        names(per_ds) <- names(dataset_dirs)
+        
+        ## 進行 Stouffer 合併（含 Z, p_meta, padj_meta, logFC_mean, n_ds ...）
+        comb <- .combine_one_predictor(per_ds)
+        if (is.null(comb) || !nrow(comb)) next
+        
+        ## 寫出 meta 結果：
+        ## <out_root>/<STRATUM>/<VERSION>/<SUBUNIT>/DPS_meta_stouffer.csv
+        out_dir <- file.path(out_root, st, ver, su_name)
+        dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+        out_fp <- file.path(out_dir, "DPS_meta_stouffer.csv")
+        data.table::fwrite(comb, out_fp)
+        
+        if (exists("log_msg", mode="function")) {
+          try(
+            log_msg("  [DPS meta] stratum={st} ver={ver} su={su_name} -> {out_fp}"),
+            silent = TRUE
+          )
+        }
+      } # end for each su_tag
+    }   # end for ver
+  }     # end for st
+  
+  invisible(TRUE)
+}
+
+## =========================================================
+## [DPS-meta] 執行跨資料集的 Stouffer 合併
+## =========================================================
+
+## 建立「實際 DPS 結果所在的根目錄」對照表：
+##   - combo 模式（例如 COMBO_MODE == "combo_2"）：phospho_<combo>_ DPS/<dataset>
+##   - 非 combo 模式：<dataset>/phospho_DPS_results_TP53
+dataset_dirs_run_dps_out <- setNames(
+  if (!is.null(COMBO_PREFIX_DPS)) {
+    file.path(COMBO_PREFIX_DPS, names(dataset_dirs_run))
+  } else {
+    file.path(dataset_dirs_run, "phospho_DPS_results_TP53")
+  },
+  names(dataset_dirs_run)
 )
+
+dps_meta_stouffer(
+  dataset_dirs = dataset_dirs_run_dps_out,   # 這才是各 dataset 的 DPS base_root
+  strata       = strata,                     # c("ALL","TP53_mutant","TP53_wild_type")
+  versions     = c("RAW","BatchAdj"),
+  out_root     = if (is.null(COMBO_PREFIX_DPS))
+    "phospho_DPS_meta"
+  else
+    file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta")
+)
+
+
 
 
 ## [NEW-1b] WT vs MT ΔNES 聚合（從已落地結果彙整）
@@ -5151,9 +5686,11 @@ try(tp53_delta_nes_aggregate(
   datasets_root = datasets_root,
   dataset_ids   = names(dataset_dirs_run),
   versions      = c("RAW","BatchAdj"),
-  groups        = names(genesets_by_group),
+  groups        = names(genesets_by_group_ptm),
   stat_tags     = c("GSEA_limma_t_cont","GSEA_spearman")
 ), silent = TRUE)
+
+
 
 ## =========================================================
 ## [IMPUTATION-TEST] 插補 vs 不插補：GSEA 差異（可選 dataset/version/collection/stratum/pipelines）
@@ -5193,7 +5730,7 @@ detect_subunits_tp53 <- function(dataset_dirs, strata, versions, groups) {
   subs <- list()
   for (ds in names(dataset_dirs)) {
     for (st in strata) for (ver in versions) for (g in groups) {
-      base <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(g), ver, ds, st)
+      base <- file.path(if (is.null(COMBO_PREFIX)) "PTMsigDB" else COMBO_PREFIX, safe_fs_name(g), ver, ds, st)
       if (!dir.exists(base)) next
       cand <- list.dirs(base, full.names = FALSE, recursive = FALSE)
       cand <- cand[cand != "" & !cand %in% blacklist]
@@ -5208,14 +5745,14 @@ detect_subunits_tp53 <- function(dataset_dirs, strata, versions, groups) {
 ## ------- 你原本的設定 --------
 stat_tags <- c("GSEA_limma_t_cont", "GSEA_spearman", "GSEA_limma_interaction")
 versions  <- c("RAW","BatchAdj")
-groups    <- names(genesets_by_group)
+groups    <- names(genesets_by_group_ptm)
 dataset_ids_have <- names(dataset_dirs_run)
 
 ## -----------------------------------------------
 ## I/O：讀單一 CSV（自動容錯 pval 缺欄）
 ## -----------------------------------------------
 read_one_result_tp53 <- function(ds_id, stratum, version, subunit, grp_name, stat_tag){
-  fp <- file.path(COMBO_PREFIX %||% "phospho_csn_gsea_results_TP53_by_collection", safe_fs_name(grp_name), version, ds_id, stratum, subunit, paste0(stat_tag, ".csv"))
+  fp <- file.path(if (is.null(COMBO_PREFIX)) "PTMsigDB" else COMBO_PREFIX, safe_fs_name(grp_name), version, ds_id, stratum, subunit, paste0(stat_tag, ".csv"))
   if (!file.exists(fp)) return(NULL)
   dt <- tryCatch(data.table::fread(fp, na.strings=c("NA","NaN","")), error=function(e) NULL)
   if (is.null(dt) || !nrow(dt)) return(NULL)
@@ -5282,7 +5819,7 @@ for (ver in versions) {
       neg     = NES < 0
     )
   
-  pan_out_root <- if (is.null(COMBO_PREFIX)) file.path(getwd(), "phospho_csn_gsea_pan_summary_TP53", ver) else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53", ver)
+  pan_out_root <- if (is.null(COMBO_PREFIX)) file.path(getwd(), "phospho_site_csn_gsea_pan_summary_TP53", ver) else file.path(COMBO_PREFIX, "phospho_site_csn_gsea_pan_summary_TP53", ver)
   dir.create(pan_out_root, recursive = TRUE, showWarnings = FALSE)
   # ---- groups 標籤與版本層級輸出檔名（避免互相覆蓋）----
   groups_tag <- paste(sort(unique(vapply(groups, safe_fs_name, FUN.VALUE = character(1)))), collapse = "-")
@@ -6744,7 +7281,7 @@ run_gsea_heatmaps_for_all_datasets <- function(dataset_dirs_map = NULL,
       csvs <- csvs[grepl(pat_ds, csvs, ignore.case = TRUE)]
       csvs <- csvs[grepl(paste0(sep_pat, "summary", sep_pat), tolower(csvs))]
       # 若有指定 groups（例如只跑 H），路徑再限縮到這些群組
-      .grp_labels <- names(get0("genesets_by_group", ifnotfound = list()))
+      .grp_labels <- names(get0("genesets_by_group_ptm", ifnotfound = list()))
       if (length(.grp_labels)) {
         .gs  <- unique(vapply(.grp_labels, safe_fs_name, FUN.VALUE = character(1)))
         .pat <- paste(paste0(sep_pat, tolower(.gs), sep_pat), collapse="|")
@@ -6877,104 +7414,146 @@ run_gsea_heatmaps_for_all_datasets(
 
 
 ## =========================================================
-## [NEW] Summarize meta-FDR (Stouffer → BH) across subunits
-##   - Input:  csn_gsea_pan_summary_TP53/meta_fdr/<STRATUM>/<RAW|BatchAdj>/<SUBUNIT>/<GROUP>/GSEA_limma_t_cont_meta_fdr.csv
-##   - Output: .../summary/<STRATUM>/<RAW|BatchAdj>/<GROUP>/GSEA_limma_t_cont_meta_fdr/
-##              ├─ Summary_<GROUP>_GSEA_limma_t_cont_meta_fdr_ALL.csv
-##              ├─ Summary_<GROUP>_GSEA_limma_t_cont_meta_fdr_padjLT0.05.csv
-##              └─ Summary_<GROUP>_GSEA_limma_t_cont_meta_fdr_padjLT0.25.csv
-##   - Columns merged per subunit: Z_<SUBUNIT>, padj_meta_<SUBUNIT>
-##   - Counting uses padj_meta thresholds; direction by sign(Z).
+## =========================================================
+## [DPS-meta summary] Summarize DPS Stouffer meta across subunits
+##
+##   - Input:
+##       <meta_root>/<STRATUM>/<RAW|BatchAdj>/<SUBUNIT>/DPS_meta_stouffer.csv
+##     其中每個檔案來自 dps_meta_stouffer()，已經是
+##     site-level (site_id) 的跨資料集 Stouffer 合併結果
+##
+##   - Output:
+##       <meta_root>/summary/<STRATUM>/<RAW|BatchAdj>/DPS/DPS_meta_stouffer/
+##          ├─ Summary_DPS_DPS_meta_stouffer_ALL.csv
+##          ├─ Summary_DPS_DPS_meta_stouffer_padjLT0.05.csv
+##          ├─ Summary_DPS_DPS_meta_stouffer_padjLT0.25.csv
+##          └─ Summary_DPS_DPS_meta_stouffer.xlsx
+##
+##   - 統合方式：
+##       1. 逐個 subunit/predictor 讀進 (Z, padj_meta) 對應到該 subunit
+##          → 變成欄位 Z_<SUBUNIT>, padj_meta_<SUBUNIT>
+##       2. full_join by site_id (site_id 相當於 PTM-SEA 的 pathway)
+##       3. 計算每個 site 有多少 subunits 顯著、多少正向/負向
+##          (padj_meta < 0.05 / 0.25，方向看 Z_*)
 ## =========================================================
 
-.read_meta_fdr_table <- function(meta_root, stratum, version, subunit,
-                                 group_name, stat_tag = "GSEA_limma_t_cont_meta_fdr") {
+.read_dps_meta_table <- function(meta_root, stratum, version, subunit,
+                                 stat_tag = "DPS_meta_stouffer") {
   if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
-  grp <- safe_fs_name(group_name)
-  fp  <- file.path(meta_root, stratum, version, subunit, grp, paste0(stat_tag, ".csv"))
+  
+  fp <- file.path(meta_root, stratum, version, subunit, "DPS_meta_stouffer.csv")
   if (!file.exists(fp)) return(NULL)
-  dt <- tryCatch(data.table::fread(fp, na.strings = c("NA","NaN","")), error = function(e) NULL)
+  
+  dt <- tryCatch(
+    data.table::fread(fp, na.strings = c("NA","NaN","")),
+    error = function(e) NULL
+  )
   if (is.null(dt)) return(NULL)
-  need <- c("pathway","Z","padj_meta")
-  # 寬鬆對應
+  
+  need <- c("site_id","Z","padj_meta")
+  ## 容錯式欄位名稱 mapping
   nms <- tolower(names(dt))
-  if (!"pathway"   %in% names(dt) && "pathway"   %in% nms) names(dt)[match("pathway", nms)]   <- "pathway"
+  if (!"site_id"   %in% names(dt) && "site_id"   %in% nms) names(dt)[match("site_id", nms)]   <- "site_id"
   if (!"Z"         %in% names(dt) && "z"         %in% nms) names(dt)[match("z", nms)]         <- "Z"
   if (!"padj_meta" %in% names(dt) && "padj_meta" %in% nms) names(dt)[match("padj_meta", nms)] <- "padj_meta"
   if (!all(need %in% names(dt))) return(NULL)
+  
   out <- as.data.frame(dt[, ..need])
   names(out)[names(out) == "Z"]         <- paste0("Z_", subunit)
   names(out)[names(out) == "padj_meta"] <- paste0("padj_meta_", subunit)
   out
 }
 
-.merge_subunit_tables_meta <- function(tbl_list) {
+.merge_subunit_tables_dps <- function(tbl_list) {
   keep <- tbl_list[!vapply(tbl_list, is.null, logical(1))]
   if (!length(keep)) return(NULL)
-  out <- Reduce(function(x, y) dplyr::full_join(x, y, by = "pathway"), keep)
-  num_cols <- setdiff(names(out), "pathway")
+  out <- Reduce(function(x, y) dplyr::full_join(x, y, by = "site_id"), keep)
+  num_cols <- setdiff(names(out), "site_id")
   out[num_cols] <- lapply(out[num_cols], function(z) suppressWarnings(as.numeric(z)))
   out
 }
 
-.add_sig_counts_meta <- function(df, alphas = c(0.05, 0.25)) {
+.add_sig_counts_meta_dps <- function(df, alphas = c(0.05, 0.25)) {
   if (is.null(df) || !nrow(df)) return(df)
+  
   padj_cols <- grep("^padj_meta_", names(df), value = TRUE)
   subs      <- sub("^padj_meta_", "", padj_cols)
   z_cols    <- paste0("Z_", subs)
+  
   keep_idx  <- z_cols %in% names(df)
-  padj_cols <- padj_cols[keep_idx]; z_cols <- z_cols[keep_idx]
+  padj_cols <- padj_cols[keep_idx]
+  z_cols    <- z_cols[keep_idx]
   if (!length(padj_cols)) return(df)
   
   for (a in alphas) {
     a_tag <- gsub("\\.", "_", sprintf("%.2f", a))
-    sig_mat <- sapply(padj_cols, function(p) { pv <- df[[p]]; as.integer(is.finite(pv) & pv < a) })
+    
+    ## 幾個 subunits 在這個 site 達到 padj_meta < a (不看方向)
+    sig_mat <- sapply(padj_cols, function(p) {
+      pv <- df[[p]]
+      as.integer(is.finite(pv) & pv < a)
+    })
     if (is.null(dim(sig_mat))) sig_mat <- matrix(sig_mat, ncol = 1)
     df[[sprintf("sig_n_padj_meta_%s", a_tag)]] <- rowSums(sig_mat, na.rm = TRUE)
     
-    pos_mat <- mapply(function(p, zc) { pv <- df[[p]]; zv <- df[[zc]]
-    as.integer(is.finite(pv) & pv < a & is.finite(zv) & zv > 0) },
-    padj_cols, z_cols, SIMPLIFY = TRUE)
+    ## 正向顯著：padj_meta < a 且 Z > 0
+    pos_mat <- mapply(function(p, zc) {
+      pv <- df[[p]]
+      zv <- df[[zc]]
+      as.integer(is.finite(pv) & pv < a & is.finite(zv) & zv > 0)
+    }, padj_cols, z_cols, SIMPLIFY = TRUE)
     if (is.null(dim(pos_mat))) pos_mat <- matrix(pos_mat, ncol = 1)
     df[[sprintf("pos_n_padj_meta_%s", a_tag)]] <- rowSums(pos_mat, na.rm = TRUE)
     
-    neg_mat <- mapply(function(p, zc) { pv <- df[[p]]; zv <- df[[zc]]
-    as.integer(is.finite(pv) & pv < a & is.finite(zv) & zv < 0) },
-    padj_cols, z_cols, SIMPLIFY = TRUE)
+    ## 負向顯著：padj_meta < a 且 Z < 0
+    neg_mat <- mapply(function(p, zc) {
+      pv <- df[[p]]
+      zv <- df[[zc]]
+      as.integer(is.finite(pv) & pv < a & is.finite(zv) & zv < 0)
+    }, padj_cols, z_cols, SIMPLIFY = TRUE)
     if (is.null(dim(neg_mat))) neg_mat <- matrix(neg_mat, ncol = 1)
     df[[sprintf("neg_n_padj_meta_%s", a_tag)]] <- rowSums(neg_mat, na.rm = TRUE)
   }
+  
   df
 }
 
-.write_summary_outputs_meta_csv <- function(df, out_dir, group_name,
-                                            stat_tag = "GSEA_limma_t_cont_meta_fdr") {
+.write_summary_outputs_meta_csv_dps <- function(df, out_dir,
+                                                group_name = "DPS",
+                                                stat_tag   = "DPS_meta_stouffer") {
   if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
   if (!requireNamespace("openxlsx", quietly = TRUE)) stop("請先安裝 openxlsx")
-  if (is.null(df) || !nrow(df)) { 
-    if (exists("log_msg", mode="function")) try(log_msg("  [略過輸出] {group_name} | {stat_tag} 無可用結果"), silent = TRUE)
+  
+  if (is.null(df) || !nrow(df)) {
+    if (exists("log_msg", mode="function")) {
+      try(log_msg("  [略過輸出] {group_name} | {stat_tag} 無可用結果"), silent = TRUE)
+    }
     return(invisible(NULL))
   }
+  
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   base <- file.path(out_dir, paste0("Summary_", safe_fs_name(group_name), "_", stat_tag))
   
-  ## ---- 排序：優先顯示顯著數量（0.05）、再顯示正/負向顯著數 ----
+  ## ---- 排序：優先顯示 padj_meta<0.05 的 subunit 數，再正向/負向，再 site_id
   ord_keys <- c("sig_n_padj_meta_0_05","pos_n_padj_meta_0_05","neg_n_padj_meta_0_05")
   ord_keys <- intersect(ord_keys, names(df))
   if (length(ord_keys)) {
     df <- df |>
-      dplyr::arrange(dplyr::desc(.data[[ord_keys[1]]]),
-                     dplyr::desc(ifelse(length(ord_keys) > 1, .data[[ord_keys[2]]], 0)),
-                     dplyr::desc(ifelse(length(ord_keys) > 2, .data[[ord_keys[3]]], 0)),
-                     .data[["pathway"]])
+      dplyr::arrange(
+        dplyr::desc(.data[[ord_keys[1]]]),
+        dplyr::desc(ifelse(length(ord_keys) > 1, .data[[ord_keys[2]]], 0)),
+        dplyr::desc(ifelse(length(ord_keys) > 2, .data[[ord_keys[3]]], 0)),
+        .data[["site_id"]]
+      )
   } else {
-    df <- df |> dplyr::arrange(.data[["pathway"]])
+    df <- df |> dplyr::arrange(.data[["site_id"]])
   }
   
-  ## ---- CSV 輸出（ALL / padj<0.05 / padj<0.25）----
+  ## ---- 輸出 CSV (ALL / padjLT0.05 / padjLT0.25)
   data.table::fwrite(df, paste0(base, "_ALL.csv"))
   
-  df005 <- NULL; df025 <- NULL
+  df005 <- NULL
+  df025 <- NULL
   if ("sig_n_padj_meta_0_05" %in% names(df)) {
     df005 <- df |> dplyr::filter(.data[["sig_n_padj_meta_0_05"]] > 0)
     dir.create(dirname(paste0(base, "_padjLT0.05.csv")), recursive = TRUE, showWarnings = FALSE)
@@ -6986,8 +7565,9 @@ run_gsea_heatmaps_for_all_datasets(
     data.table::fwrite(df025, paste0(base, "_padjLT0.25.csv"))
   }
   
-  ## ---- XLSX 輸出（ALL / padjLT0.05 / padjLT0.25 三工作表）----
+  ## ---- XLSX (三個 sheet: ALL / padjLT0.05 / padjLT0.25)
   wb <- openxlsx::createWorkbook()
+  
   openxlsx::addWorksheet(wb, "ALL")
   openxlsx::writeData(wb, "ALL", df)
   openxlsx::freezePane(wb, "ALL", firstRow = TRUE)
@@ -7010,55 +7590,539 @@ run_gsea_heatmaps_for_all_datasets(
   openxlsx::saveWorkbook(wb, paste0(base, ".xlsx"), overwrite = TRUE)
   
   if (exists("log_msg", mode="function")) {
-    try(log_msg("  [完成輸出] {group_name} | {stat_tag} -> {dirname(base)} (.csv + .xlsx)"), silent = TRUE)
+    try(log_msg("  [完成輸出] {group_name} | {stat_tag} -> {dirname(base)} (.csv + .xlsx)"),
+        silent = TRUE)
   }
+  
   invisible(NULL)
 }
 
-
 summarize_meta_fdr_across_subunits <- function(
-    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
+    meta_root = if (is.null(COMBO_PREFIX_DPS))
+      "phospho_DPS_meta"
+    else
+      file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta"),
     strata    = c("ALL","TP53_mutant","TP53_wild_type"),
     versions  = c("RAW","BatchAdj"),
-    genesets_by_group = genesets_by_group,
-    stat_tag  = "GSEA_limma_t_cont_meta_fdr"
+    stat_tag  = "DPS_meta_stouffer"
 ){
   if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
+  
   for (st in strata) for (ver in versions) {
     base_dir <- file.path(meta_root, st, ver)
     if (!dir.exists(base_dir)) next
-    # 自動偵測 subunit 清單：抓該層的第一層子目錄名稱
+    
+    ## 自動偵測 subunit/predictor 名稱（目錄名）
     subs <- list.dirs(base_dir, full.names = FALSE, recursive = FALSE)
     subs <- subs[nzchar(subs)]
     if (!length(subs)) next
     
-    for (grp in names(genesets_by_group)) {
-      if (exists("log_msg", mode="function")) try(log_msg("== [meta-summary] stratum=%s | version=%s | group=%s ==", st, ver, grp), silent = TRUE)
-      lst <- setNames(vector("list", length(subs)), subs)
-      for (su in subs) lst[[su]] <- .read_meta_fdr_table(meta_root, st, ver, su, grp, stat_tag)
-      wide <- .merge_subunit_tables_meta(lst)
-      wide <- .add_sig_counts_meta(wide, alphas = c(0.05, 0.25))
-      out_dir <- file.path(meta_root, "summary", st, ver, safe_fs_name(grp), stat_tag)
-      .write_summary_outputs_meta_csv(wide, out_dir, grp, stat_tag)
+    if (exists("log_msg", mode="function")) {
+      try(log_msg("== [DPS-meta-summary] stratum=%s | version=%s ==", st, ver), silent = TRUE)
     }
+    
+    ## 把每個 subunit 的 meta 結果 (Z, padj_meta) 收集起來
+    lst <- setNames(vector("list", length(subs)), subs)
+    for (su in subs) {
+      lst[[su]] <- .read_dps_meta_table(meta_root, st, ver, su, stat_tag)
+    }
+    
+    ## wide: site_id 為列，Z_<SU> / padj_meta_<SU> 為欄
+    wide <- .merge_subunit_tables_dps(lst)
+    
+    ## 加上顯著統計 (padj_meta<0.05 / 0.25，正向/負向)
+    wide <- .add_sig_counts_meta_dps(wide, alphas = c(0.05, 0.25))
+    
+    ## 寫出 summary
+    out_dir <- file.path(meta_root, "summary", st, ver, "DPS", stat_tag)
+    .write_summary_outputs_meta_csv_dps(
+      wide,
+      out_dir,
+      group_name = "DPS",
+      stat_tag   = stat_tag
+    )
   }
+  
   invisible(TRUE)
 }
 
-## ---- 一鍵執行（不重跑 GSEA；僅讀既有 *_meta_fdr.csv 後彙整）----
+## ---- 一鍵執行（不重跑 DPS；僅讀既有 DPS_meta_stouffer.csv 後彙整）----
 posthoc_summary_meta_fdr <- function(){
   summarize_meta_fdr_across_subunits(
-    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
-    strata           = c("ALL","TP53_mutant","TP53_wild_type"),
-    versions         = c("RAW","BatchAdj"),
-    genesets_by_group = genesets_by_group,
-    stat_tag         = "GSEA_limma_t_cont_meta_fdr"
+    meta_root = if (is.null(COMBO_PREFIX_DPS))
+      "phospho_DPS_meta"
+    else
+      file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta"),
+    strata    = c("ALL","TP53_mutant","TP53_wild_type"),
+    versions  = c("RAW","BatchAdj"),
+    stat_tag  = "DPS_meta_stouffer"
   )
   invisible(TRUE)
 }
 
-## 直接跑一次（可重複執行；會覆蓋同名 csv）
+## 直接跑一次（可重複執行；會覆蓋同名 csv / xlsx）
 posthoc_summary_meta_fdr()
+
+
+## ---- [NEW | DPS meta-FDR heatmap (ggplot2)] ----
+## 目的：
+## 1. 讀取你 DPS pipeline 的 meta Stouffer FDR 總結檔
+##    (phospho_combo_2_ DPS/phospho_DPS_meta/summary/<STRATUM>/BatchAdj/DPS/DPS_meta_stouffer/
+##     Summary_DPS_DPS_meta_stouffer_ALL.csv)
+##    三層：ALL / TP53_mutant / TP53_wild_type
+##
+## 2. 從 PTMsigDB 選定一個或多個 phosphosite set (pathway)，把裡面的 site_id 全部抓出
+##
+## 3. 以 ALL stratum 的 Z_CSN_SCORE 來決定：
+##    - y 軸順序（Z_CSN_SCORE 越大越上面）
+##    - 要畫哪些 site（預設取 Z_CSN_SCORE 最大前 top_n_pos 個 + 最小前 top_n_neg 個）
+##    之後 TP53_mutant、TP53_wild_type 也用同一批 site_id 和同一個順序畫圖，
+##    以利比較。
+##
+## 4. 畫熱圖 (ggplot2::geom_tile)：
+##    x 軸 = predictor (COPS subunits, CSN_SCORE, GPS1, RESIDUAL_*…)
+##    y 軸 = phosphosite (site_id)
+##    fill = Z_<predictor>
+##    疊上顯著標記：padj_meta_<predictor> < 0.05
+##    色階的正/負向顏色可以指定 (col_up for Z>0, col_down for Z<0)
+##
+## 5. 同時輸出：
+##    - 圖檔（預設 only .tiff；若 out_formats 包含 "png"/"pdf"/"jpg" 也會一起輸出）
+##    - 對應的數據檔 .csv（每列為一個 site_id，欄位是所有 predictor 的 Z_* 和 padj_meta_*；
+##      匯出的是整個目標 pathway(s) 的全集，不只畫在熱圖上的 top/bottom）
+##
+## 假設：
+## - 你已經有 global 的 genesets_by_group_ptm，且
+##   genesets_by_group_ptm[["PTMsigDB"]] 是一個 list：
+##   names = pathway 名，value = 這個 pathway 的 phosphosite 向量 (像 "SORBS1_S1")
+##
+## - COMBO_PREFIX_DPS（若 combo 模式，例如 "phospho_combo_2_ DPS"）已經存在，
+##   路徑邏輯和 summarize_meta_fdr_across_subunits() / posthoc_summary_meta_fdr() 相同
+##
+## - 目前 meta summary 是存在 BatchAdj 版本下，檔名固定叫 Summary_DPS_DPS_meta_stouffer_ALL.csv
+##   在三個 stratum (ALL / TP53_mutant / TP53_wild_type) 路徑皆同名
+##
+## 依賴套件：data.table, ggplot2, dplyr, scales
+## ------------------------------------------------------------
+
+.read_dps_summary_csv <- function(
+    stratum,
+    base_root = if (is.null(COMBO_PREFIX_DPS))
+      "phospho_DPS_meta"
+    else
+      file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta"),
+    version   = "BatchAdj"
+){
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
+  fp <- file.path(
+    base_root,
+    "summary",
+    stratum,
+    version,
+    "DPS",
+    "DPS_meta_stouffer",
+    "Summary_DPS_DPS_meta_stouffer_ALL.csv"
+  )
+  if (!file.exists(fp)) {
+    stop("找不到 DPS summary 檔案：", fp)
+  }
+  data.table::fread(fp, na.strings = c("NA","NaN","Inf","-Inf",""))
+}
+
+.get_sites_from_ptmsigdb <- function(
+    target_pathways,
+    ptm_sets = genesets_by_group_ptm[["PTMsigDB"]]
+){
+  ## 將使用者指定的 PTMsigDB pathway(s) 對應到所有 phosphosite
+  ## 如果某 pathway 名稱不存在，就自動忽略
+  if (is.null(ptm_sets)) {
+    stop("genesets_by_group_ptm[['PTMsigDB']] 不存在，請先建立 PTMsigDB 的 phosphosite sets")
+  }
+  keep_list <- ptm_sets[target_pathways]
+  keep_list <- keep_list[!vapply(keep_list, is.null, logical(1))]
+  unique(unlist(keep_list, use.names = FALSE))
+}
+
+.build_dps_long_df_for_plot <- function(df_wide, keep_sites_ordered){
+  ## 把寬表（site_id, Z_xxx, padj_meta_xxx, ...）轉成 long format
+  ## 並建立：
+  ##   - y 軸順序：
+  ##       * 依 ALL 的 Z_CSN_SCORE 排出的 keep_sites_ordered
+  ##       * 但要讓 Z_CSN_SCORE 最大的排在熱圖最上面
+  ##         → 因為 ggplot 的因子 levels 由下往上畫，所以我們要反轉 levels
+  ##
+  ##   - x 軸順序 & 群組間隔：
+  ##       * 排序順序仿你的 site level PTM-SEA meta FDR 熱圖：
+  ##           Z_CSN_SCORE,
+  ##           Z_GPS1,
+  ##           Z_COPS2..Z_COPS9,
+  ##           Z_RESIDUAL_GPS1,
+  ##           Z_RESIDUAL_COPS2..Z_RESIDUAL_COPS9
+  ##       * 僅在
+  ##           (Z_CSN_SCORE ↔ Z_GPS1) 之間
+  ##         以及
+  ##           (Z_COPS9 ↔ Z_RESIDUAL_GPS1) 之間
+  ##         插入一個 gap
+  ##         （這就是你 site level PTM-SEA 熱圖的空白位置）
+  ##
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("請先安裝 dplyr")
+  
+  df_sub <- df_wide[df_wide$site_id %in% keep_sites_ordered, , drop = FALSE]
+  
+  ## 找出所有 predictor 名稱（Z_*）
+  z_cols     <- grep("^Z_", names(df_sub), value = TRUE)
+  pred_names <- sub("^Z_", "", z_cols)
+  
+  ## long format
+  long_lst <- lapply(pred_names, function(pr){
+    data.frame(
+      site_id   = df_sub$site_id,
+      predictor = paste0("Z_", pr),
+      Z         = df_sub[[paste0("Z_", pr)]],
+      padj_meta = df_sub[[paste0("padj_meta_", pr)]],
+      stringsAsFactors = FALSE
+    )
+  })
+  df_long <- do.call(rbind, long_lst)
+  
+  ## y 軸順序（依 keep_sites_ordered；此向量已做成由小→大）
+  df_long$site_id <- factor(
+    df_long$site_id,
+    levels  = keep_sites_ordered,
+    ordered = TRUE
+  )
+  
+  ## ---- x 軸順序 & 群組間隔（仿 PTM-SEA meta FDR 熱圖）----
+  canonical_order <- c(
+    "Z_CSN_SCORE",
+    "Z_GPS1",
+    "Z_COPS2","Z_COPS3","Z_COPS4","Z_COPS5","Z_COPS6","Z_COPS7A","Z_COPS7B","Z_COPS8","Z_COPS9",
+    "Z_RESIDUAL_GPS1",
+    "Z_RESIDUAL_COPS2","Z_RESIDUAL_COPS3","Z_RESIDUAL_COPS4","Z_RESIDUAL_COPS5","Z_RESIDUAL_COPS6",
+    "Z_RESIDUAL_COPS7A","Z_RESIDUAL_COPS7B","Z_RESIDUAL_COPS8","Z_RESIDUAL_COPS9"
+  )
+  
+  present_preds <- intersect(canonical_order, unique(df_long$predictor))
+  leftover      <- setdiff(unique(df_long$predictor), present_preds)
+  ## leftover（理論上幾乎不會用到）就往最後面丟，保底
+  present_preds <- c(present_preds, sort(leftover))
+  
+  ## 群組間隔（gap）策略：
+  ##   gap1: Z_CSN_SCORE ↔ Z_GPS1 之間
+  ##   gap2: Z_COPS9 ↔ Z_RESIDUAL_GPS1 之間
+  ##
+  gap_after_preds <- c("Z_CSN_SCORE","Z_COPS9")
+  gap_size <- 0.4
+  
+  pos_map <- list()
+  cur_pos <- 0
+  for (p in present_preds) {
+    cur_pos <- cur_pos + 1
+    pos_map[[p]] <- cur_pos
+    if (p %in% gap_after_preds) {
+      cur_pos <- cur_pos + gap_size
+    }
+  }
+  
+  ## 寫回對應的連續 x 座標
+  df_long$xpos <- unname(
+    vapply(df_long$predictor, function(p) pos_map[[p]], numeric(1))
+  )
+  
+  list(
+    df_long       = df_long,
+    present_preds = present_preds,
+    xpos_map      = pos_map
+  )
+}
+
+
+
+.save_dps_heatmap_outputs <- function(
+    p,
+    df_export,
+    out_dir,
+    out_stub,
+    width_cm,
+    height_cm,
+    dpi        = 600,
+    formats    = c("tiff")
+){
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
+  if (!requireNamespace("ggplot2",   quietly = TRUE)) stop("請先安裝 ggplot2")
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  ## 1. 存圖檔（多格式）
+  for (fmt in formats) {
+    fp <- file.path(out_dir, paste0(out_stub, ".", fmt))
+    if (fmt %in% c("tiff","tif")) {
+      ggplot2::ggsave(
+        filename = fp, plot = p,
+        width = width_cm/2.54, height = height_cm/2.54,
+        dpi = dpi, compression = "lzw", units = "in"
+      )
+    } else {
+      ggplot2::ggsave(
+        filename = fp, plot = p,
+        width = width_cm/2.54, height = height_cm/2.54,
+        dpi = dpi, units = "in"
+      )
+    }
+  }
+  
+  ## 2. 存熱圖數據（行 = site_id，全 set，而非僅 top/bottom；欄 = Z_* 與 padj_meta_*）
+  data.table::fwrite(
+    df_export,
+    file.path(out_dir, paste0(out_stub, "_data.csv"))
+  )
+  
+  invisible(TRUE)
+}
+
+plot_dps_meta_heatmap_for_pathways <- function(
+    target_pathways,
+    top_n_pos   = 25,   ## 取 Z_CSN_SCORE 最大的前 N 個
+    top_n_neg   = 25,   ## 取 Z_CSN_SCORE 最小的前 N 個
+    version     = "BatchAdj",
+    base_root   = if (is.null(COMBO_PREFIX_DPS))
+      "phospho_DPS_meta"
+    else
+      file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta"),
+    col_up      = "#67001F",   ## Z > 0 的顏色 (上調)
+    col_down    = "#053061",   ## Z < 0 的顏色 (下調)
+    mid_col     = "#FFFFFF",
+    alpha_sig   = 0.05,        ## padj_meta 判定顯著的門檻
+    out_formats = c("tiff")    ## 也可指定 c("tiff","png","pdf","jpg")
+){
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("請先安裝 data.table")
+  if (!requireNamespace("ggplot2",    quietly = TRUE)) stop("請先安裝 ggplot2")
+  if (!requireNamespace("dplyr",      quietly = TRUE)) stop("請先安裝 dplyr")
+  if (!requireNamespace("scales",     quietly = TRUE)) stop("請先安裝 scales")
+  
+  ## --------------------------------------------------------
+  ## (1) 讀三個 stratum 的 DPS meta summary (寬表)
+  ## --------------------------------------------------------
+  wide_ALL <- .read_dps_summary_csv("ALL",            base_root, version)
+  wide_MT  <- .read_dps_summary_csv("TP53_mutant",    base_root, version)
+  wide_WT  <- .read_dps_summary_csv("TP53_wild_type", base_root, version)
+  
+  ## --------------------------------------------------------
+  ## (2) 從 PTMsigDB 取使用者指定的 pathway(s) 裡所有 phosphosite
+  ## --------------------------------------------------------
+  all_sites_in_sets <- .get_sites_from_ptmsigdb(
+    target_pathways,
+    ptm_sets = genesets_by_group_ptm[["PTMsigDB"]]
+  )
+  
+  ## --------------------------------------------------------
+  ## (3) 用 ALL stratum 來決定：
+  ##     - y 軸排序 (依 Z_CSN_SCORE)
+  ##     - 要畫哪些 site (top_n_pos + top_n_neg)
+  ## --------------------------------------------------------
+  wide_ALL_keep <- wide_ALL[wide_ALL$site_id %in% all_sites_in_sets, , drop = FALSE]
+  
+  if (!"Z_CSN_SCORE" %in% names(wide_ALL_keep)) {
+    stop("ALL stratum summary 缺少 Z_CSN_SCORE 欄位，無法依 Z_CSN_SCORE 排序")
+  }
+  
+  ## 依 Z_CSN_SCORE 由大到小、由小到大
+  ord_pos <- wide_ALL_keep$site_id[order(-wide_ALL_keep$Z_CSN_SCORE)]
+  ord_pos <- unique(ord_pos)
+  ord_neg <- wide_ALL_keep$site_id[order( wide_ALL_keep$Z_CSN_SCORE)]
+  ord_neg <- unique(ord_neg)
+  
+  sel_pos <- head(ord_pos, top_n_pos)
+  sel_neg <- head(ord_neg, top_n_neg)
+  
+  ## [FIX] y 軸最終採用 Z_CSN_SCORE 由小→大（越大越上）
+  ##       先最負 → 較少負 → 小正 → 最大正
+  site_order    <- c(sel_neg, rev(sel_pos))
+  heatmap_sites <- unique(site_order)
+  
+  ## --------------------------------------------------------
+  ## (4) 準備 long format（ALL / TP53_mutant / TP53_wild_type）
+  ##     但 y 軸的 levels 全部用 site_order
+  ## --------------------------------------------------------
+  prep_ALL <- .build_dps_long_df_for_plot(wide_ALL, site_order)
+  prep_MT  <- .build_dps_long_df_for_plot(wide_MT,  site_order)
+  prep_WT  <- .build_dps_long_df_for_plot(wide_WT,  site_order)
+  
+  ## --------------------------------------------------------
+  ## (5) 畫單一 stratum 的熱圖（y 使用 site_order，僅畫 heatmap_sites）
+  ## --------------------------------------------------------
+  .make_stratum_plot <- function(prep_obj, stratum_label){
+    df_long       <- prep_obj$df_long
+    present_preds <- prep_obj$present_preds
+    pos_map       <- prep_obj$xpos_map
+    
+    ## 只畫 top_n_pos / top_n_neg 決定出來的 heatmap_sites
+    df_long <- df_long[df_long$site_id %in% heatmap_sites, , drop = FALSE]
+    
+    ## 對稱色階：正紅、負藍，中間白
+    lim <- max(abs(df_long$Z), na.rm = TRUE)
+    if (!is.finite(lim) || lim <= 0) lim <- 1
+    
+    ## x 軸 breaks/labels 依照 present_preds 的順序，並用前面 pos_map 計算後的帶 gap 座標
+    x_breaks <- unname(vapply(present_preds, function(p) pos_map[[p]], numeric(1)))
+    x_labs   <- present_preds
+    
+    ggplot2::ggplot(
+      df_long,
+      ggplot2::aes(x = xpos, y = site_id, fill = Z)
+    ) +
+      ## 方塊本身：無邊框，就像你 site level PTM-SEA 的熱圖
+      ggplot2::geom_tile(
+        width  = 0.9,
+        height = 0.9,
+        color  = NA
+      ) +
+      ## 顯著性點：padj_meta < alpha_sig → 畫小顆黑色實心點
+      ## 點要小一點（跟你 site level PTM-SEA 熱圖一致），避免主色塊被蓋滿
+      ggplot2::geom_point(
+        data = df_long[df_long$padj_meta < alpha_sig &
+                         is.finite(df_long$padj_meta), , drop = FALSE],
+        ggplot2::aes(x = xpos, y = site_id),
+        inherit.aes = FALSE,
+        shape       = 16,     # 實心圓
+        size        = 0.6,    # 更小，貼近你舊圖
+        colour      = "black"
+      ) +
+      ggplot2::scale_fill_gradient2(
+        low       = col_down,
+        mid       = mid_col,
+        high      = col_up,
+        midpoint  = 0,
+        limits    = c(-lim, lim),
+        oob       = scales::squish,
+        name      = "Z"
+      ) +
+      ## y 軸保持我們剛剛在 build_dps_long_df_for_plot() 設定好的 levels
+      ggplot2::scale_y_discrete(drop = FALSE) +
+      ## x 軸用連續座標 + 自訂 breaks（含 gap）
+      ggplot2::scale_x_continuous(
+        breaks   = x_breaks,
+        labels   = x_labs,
+        expand   = ggplot2::expansion(mult = c(0.02, 0.02)),
+        position = "top"
+      ) +
+      ggplot2::labs(
+        x = paste0("predictor (", stratum_label, ")"),
+        y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 11) +
+      ggplot2::theme(
+        panel.grid      = ggplot2::element_blank(),
+        ## 把 y 軸文字縮小，避免像你說的「互相疊合」
+        axis.text.y     = ggplot2::element_text(size = 5),
+        ## x 軸標籤的字體也縮小，並維持垂直放置與靠左的樣式
+        axis.text.x     = ggplot2::element_text(
+          angle = 90,
+          hjust = 0,
+          vjust = 0.5,
+          size  = 5
+        ),
+        ## margin 收斂成和你 site level PTM-SEA 類似的排版，不要太寬也不要擠到圖
+        plot.margin     = ggplot2::margin(5.5, 20, 5.5, 5.5, "pt"),
+        legend.position = "right",
+        legend.title    = ggplot2::element_text(size = 7),
+        legend.text     = ggplot2::element_text(size = 6)
+      )
+  }
+  
+  p_ALL <- .make_stratum_plot(prep_ALL, "ALL")
+  p_MT  <- .make_stratum_plot(prep_MT,  "TP53_mutant")
+  p_WT  <- .make_stratum_plot(prep_WT,  "TP53_wild_type")
+  
+  ## --------------------------------------------------------
+  ## (6) 匯出
+  ##     - 圖檔（tiff / png / pdf / jpg）
+  ##     - 數據檔 (全部 site_in_sets，不只 top/bottom)
+  ## --------------------------------------------------------
+  path_stub <- safe_fs_name(paste(target_pathways, collapse = "_"))
+  
+  out_stub_base <- paste0(
+    "DPS_meta_heatmap_",
+    path_stub,
+    "_top", top_n_pos, "pos_bot", top_n_neg, "neg_",
+    version
+  )
+  
+  ## ALL
+  out_dir_ALL <- file.path(
+    base_root, "summary", "ALL", "BatchAdj", "DPS", "DPS_meta_stouffer"
+  )
+  .save_dps_heatmap_outputs(
+    p           = p_ALL,
+    df_export   = wide_ALL[wide_ALL$site_id %in% all_sites_in_sets, , drop = FALSE],
+    out_dir     = out_dir_ALL,
+    out_stub    = paste0(out_stub_base, "_ALL"),
+    width_cm    = max(6, length(prep_ALL$present_preds) * 0.6),
+    height_cm   = max(6, length(site_order) * 0.25),
+    formats     = out_formats
+  )
+  
+  ## TP53_mutant
+  out_dir_MT <- file.path(
+    base_root, "summary", "TP53_mutant", "BatchAdj", "DPS", "DPS_meta_stouffer"
+  )
+  .save_dps_heatmap_outputs(
+    p           = p_MT,
+    df_export   = wide_MT[wide_MT$site_id %in% all_sites_in_sets, , drop = FALSE],
+    out_dir     = out_dir_MT,
+    out_stub    = paste0(out_stub_base, "_TP53_mutant"),
+    width_cm    = max(6, length(prep_MT$present_preds) * 0.6),
+    height_cm   = max(6, length(site_order) * 0.25),
+    formats     = out_formats
+  )
+  
+  ## TP53_wild_type
+  out_dir_WT <- file.path(
+    base_root, "summary", "TP53_wild_type", "BatchAdj", "DPS", "DPS_meta_stouffer"
+  )
+  .save_dps_heatmap_outputs(
+    p           = p_WT,
+    df_export   = wide_WT[wide_WT$site_id %in% all_sites_in_sets, , drop = FALSE],
+    out_dir     = out_dir_WT,
+    out_stub    = paste0(out_stub_base, "_TP53_wild_type"),
+    width_cm    = max(6, length(prep_WT$present_preds) * 0.6),
+    height_cm   = max(6, length(site_order) * 0.25),
+    formats     = out_formats
+  )
+  
+  ## invisibly 回傳圖 + 排序（方便互動式檢查，不影響寫檔）
+  invisible(list(
+    ALL            = list(plot = p_ALL, order = site_order),
+    TP53_mutant    = list(plot = p_MT,  order = site_order),
+    TP53_wild_type = list(plot = p_WT,  order = site_order)
+  ))
+}
+## ---- [END NEW | DPS meta-FDR heatmap (ggplot2)] ----
+
+
+plot_dps_meta_heatmap_for_pathways(
+  target_pathways = c("PATH-NP_NOTCH_PATHWAY"),
+  top_n_pos   = 25,
+  top_n_neg   = 25,
+  version     = "BatchAdj",
+  base_root   = if (is.null(COMBO_PREFIX_DPS))
+    "phospho_DPS_meta"
+  else
+    file.path(COMBO_PREFIX_DPS, "phospho_DPS_meta"),
+  col_up      = "#67001F",
+  col_down    = "#053061",
+  out_formats = c("tiff")  ## 或 c("tiff","png","pdf","jpg")
+)
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -7078,10 +8142,10 @@ posthoc_summary_meta_fdr()
 
 posthoc_summary_meta_fdr_interaction <- function(){
   summarize_meta_fdr_across_subunits(
-    meta_root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr"),
+    meta_root = if (is.null(COMBO_PREFIX)) "PTMsigDB/meta_fdr" else file.path(COMBO_PREFIX, "PTMsigDB", "meta_fdr"),
     strata            = c("ALL","TP53_mutant","TP53_wild_type"),
     versions          = c("RAW","BatchAdj"),
-    genesets_by_group = genesets_by_group,
+    genesets_by_group = genesets_by_group_ptm,
     stat_tag          = "GSEA_limma_interaction_meta_fdr"
   )
   invisible(TRUE)
@@ -7561,7 +8625,7 @@ if (!exists(".parse_meta_from_path", mode = "function")) {
 
 
 # 主程式：對找到的 meta_fdr Summary 檔畫圖，並產生 ordered 版本（依 ALL/t_cont）
-run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary" else file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary")) {
+run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "PTMsigDB/meta_fdr/summary" else file.path(COMBO_PREFIX, "PTMsigDB", "meta_fdr", "summary")) {
   csvs <- .meta_find_target_csvs(root)
   ## [NEW] 篩選要畫的 collections（PAN 熱圖）
   .cols_pan <- get0("PLOT_PAN_COLLECTIONS", ifnotfound = NULL)
@@ -7700,7 +8764,321 @@ run_meta_fdr_heatmaps <- function(root = if (is.null(COMBO_PREFIX)) "phospho_csn
 ## ---- 執行（例）----
 run_meta_fdr_heatmaps(
   root = if (is.null(COMBO_PREFIX)) 
-    "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary" 
+    "PTMsigDB/meta_fdr/summary" 
   else 
-    file.path(COMBO_PREFIX, "phospho_csn_gsea_pan_summary_TP53/meta_fdr/summary")
+    file.path(COMBO_PREFIX, "PTMsigDB", "meta_fdr", "summary")
 )
+
+
+
+
+
+
+
+
+
+
+
+## =========================================================
+## [NEW | DPS] Differential Phosphorylation Site analysis (limma)
+## - predictors：CSN subunits、CSN_SCORE、RESIDUAL_<SU>（與模板一致）
+## - strata：ALL / TP53_mutant / TP53_wild_type（與模板一致）
+## - version：RAW / BatchAdj（與模板一致；由 options(csn.run_passes) 決定）
+## - 不做插補；limma 逐位點處理 NA
+## - 輸出：
+##   有 COMBO_MODE → ./phospho_<combo>_ DPS/<dataset>/<STRATUM>/DPS/<version>/
+##   無 COMBO_MODE → <dataset>/phospho_DPS_results_TP53/<STRATUM>/DPS/<version>/
+## =========================================================
+
+.run_dps_fit <- function(M, pred, version, ds_id, out_dir,
+                         batch_all, purity_all, sa_all, mat_for_sv = NULL) {
+  ## 1) 對齊樣本與預測變數
+  sample_order <- intersect(colnames(M), names(pred))
+  pred <- pred[sample_order]
+  M    <- as.matrix(M[, sample_order, drop = FALSE])
+  
+  ## 2) 由模板組裝設計表（沿用你現有的 .build_design_for_version）
+  DF <- .build_design_for_version(
+    version        = version,
+    pred_centered  = pred,            # 模板內已做中心化：以 pred_centered 表示
+    sample_order   = sample_order,
+    batch_all      = batch_all,
+    purity_all     = purity_all,
+    sa_all         = sa_all,
+    USE_AGE_MISSING_INDICATOR = isTRUE(get0("USE_AGE_MISSING_INDICATOR", ifnotfound = FALSE)),
+    ds_id          = ds_id,
+    mat_for_sv     = mat_for_sv
+  )
+  
+  ## 3) 只選模板允許的 RHS 變項；把 pred_centered 改名為 predictor 作為主要係數
+  rhs <- intersect(c("sex", "age", "age_missing", "age_z_imputed", "batch", paste0("SV", 1:5)),
+                   colnames(DF))
+  DF2 <- data.frame(
+    predictor = DF$pred_centered,
+    DF[, rhs, drop = FALSE],
+    row.names   = rownames(DF),
+    check.names = FALSE
+  )
+  
+  ## 4) 丟掉常數/單一層級/零變異欄（永遠保留 predictor）；也丟 NA 列並對齊 M
+  keep_cols <- rep(TRUE, ncol(DF2)); names(keep_cols) <- colnames(DF2)
+  if (ncol(DF2) > 1L) {
+    keep_cols <- vapply(DF2, function(z) {
+      if (is.factor(z)) {
+        nz <- droplevels(z); (nlevels(nz) >= 2) && (sum(!is.na(nz)) >= 2)
+      } else {
+        vz <- suppressWarnings(stats::var(as.numeric(z), na.rm = TRUE))
+        is.finite(vz) && vz > 0 && sum(is.finite(z)) >= 2
+      }
+    }, logical(1))
+    if ("predictor" %in% names(keep_cols)) keep_cols["predictor"] <- TRUE
+  }
+  DF2 <- DF2[, keep_cols, drop = FALSE]
+  
+  row_keep <- stats::complete.cases(DF2)
+  if (sum(row_keep) < 3L) {
+    log_msg("[DPS|%s|%s] 設計可用樣本過少（<3）→ skip", ds_id, version)
+    return(invisible(NULL))
+  }
+  DF2 <- DF2[row_keep, , drop = FALSE]
+  M   <- M[, rownames(DF2), drop = FALSE]
+  for (cn in colnames(DF2)) if (is.factor(DF2[[cn]])) DF2[[cn]] <- droplevels(DF2[[cn]])
+  
+  stopifnot(identical(colnames(M), rownames(DF2)))
+  
+  ## 5) 建立設計矩陣（含截距）：~ predictor + RHS
+  make_X <- function(df, rhs_vars) {
+    if (length(rhs_vars)) {
+      stats::model.matrix(stats::as.formula(paste("~ predictor +", paste(rhs_vars, collapse = " + "))), data = df)
+    } else {
+      stats::model.matrix(~ predictor, data = df)
+    }
+  }
+  rhs_use <- setdiff(colnames(DF2), "predictor")
+  des     <- make_X(DF2, rhs_use)
+  
+  ## 6) 防飽和：若殘差自由度 <= 0，依序移除干擾變項直到 df_res > 0
+  rank_d <- qr(des)$rank
+  res_df <- nrow(des) - rank_d
+  if (res_df <= 0L) {
+    drop_order <- intersect(c(paste0("SV", 5:1), "batch", "sex", "age_missing", "age_z_imputed", "age"),
+                            rhs_use)
+    for (cv in drop_order) {
+      rhs_use <- setdiff(rhs_use, cv)
+      des     <- make_X(DF2, rhs_use)
+      rank_d  <- qr(des)$rank
+      res_df  <- nrow(des) - rank_d
+      log_msg("[DPS|%s|%s] 飽和防護：移除 covariate=%s → df_res=%d", ds_id, version, cv, res_df)
+      if (res_df > 0L) break
+    }
+  }
+  if (res_df <= 0L) {
+    log_msg("[DPS|%s|%s] 移除所有備選共變項仍無殘差自由度 → skip", ds_id, version)
+    return(invisible(NULL))
+  }
+  if (nrow(des) != ncol(M)) {
+    stop(sprintf("[DPS|%s|%s] 設計列數(%d) ≠ 矩陣欄數(%d)：樣本對齊失敗",
+                 ds_id, version, nrow(des), ncol(M)))
+  }
+  
+  ## 7) 擬合與輸出（以 predictor 係數為 DPS 統計）
+  fit <- limma::eBayes(limma::lmFit(M, des))
+  j   <- match("predictor", colnames(des))
+  if (is.na(j)) stop("[DPS] 設計矩陣中找不到係數：predictor")
+  tt  <- limma::topTable(fit, coef = j, number = Inf, sort.by = "none")
+  
+  # 統一輸出位點 ID 與觀測數
+  if ("ID" %in% colnames(tt)) {
+    # 如果 limma 把真正的位點 ID（例如 "AHNAK_S18"）塞在 tt$ID
+    tt$site_id <- tt$ID
+  } else {
+    # 否則用 rownames 當位點 ID
+    tt$site_id <- rownames(tt)
+  }
+  
+  tt$n_obs <- rowSums(is.finite(M))
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(tt, file.path(out_dir, "DPS_results.csv"))
+  invisible(tt)
+}
+
+
+run_dps_stratum <- function(ds_id, ds_dir, M_site_full, sample_keep, out_root, prot0_full){
+  dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+  
+  sam <- intersect(colnames(M_site_full), sample_keep)
+  if (length(sam) < (2L * min_per_group)) {
+    log_msg("  [DPS] %s 樣本不足 → skip", basename(out_root))
+    return(invisible(NULL))
+  }
+  M0     <- M_site_full[, sam, drop = FALSE]
+  prot0  <- prot0_full[,  sam, drop = FALSE]
+  
+  present_sub <- intersect(csn_subunits, rownames(prot0))
+  if (!length(present_sub)) { log_msg("  [DPS] 無 CSN subunit → skip"); return(invisible(NULL)) }
+  
+  csn_score <- build_csn_score_safe(
+    prot0, subunits = present_sub, combine_7AB = TRUE,
+    min_members = 5L, pca_min_samples = 10L
+  )
+  
+  # covariates / batch 與模板一致
+  batch_all  <- get_batch_factor_phospho(ds_dir, sam)
+  batch_all  <- if (!is.null(batch_all)) droplevels(batch_all$fac[sam]) else NULL
+  purity_all <- get_purity_covariate(ds_id, ds_dir, sam)
+  sa_all     <- get_sex_age_covariates(ds_dir, sam)
+  
+  run_passes <- getOption("csn.run_passes", c("BatchAdj"))
+  for (version in run_passes) {
+    out_ver <- file.path(out_root, version)
+    dir.create(out_ver, recursive = TRUE, showWarnings = FALSE)
+    
+    ## (1) subunits
+    for (su in present_sub) {
+      log_msg("  [DPS|%s|%s] predictor=%s", version, basename(out_root), su)
+      .run_dps_fit(
+        M = M0, pred = prot0[su, ], version = version, ds_id = ds_id,
+        out_dir = file.path(out_ver, paste0("SU__", safe_fs_name(su))),
+        batch_all = batch_all, purity_all = purity_all, sa_all = sa_all,
+        mat_for_sv = M0
+      )
+    }
+    
+    ## (2) CSN_SCORE
+    if (sum(is.finite(csn_score)) >= (2L * min_per_group)) {
+      log_msg("  [DPS|%s|%s] predictor=CSN_SCORE", version, basename(out_root))
+      .run_dps_fit(
+        M = M0, pred = csn_score, version = version, ds_id = ds_id,
+        out_dir = file.path(out_ver, "SU__CSN_SCORE"),
+        batch_all = batch_all, purity_all = purity_all, sa_all = sa_all,
+        mat_for_sv = M0
+      )
+    }
+    
+    ## (3) RESIDUAL_<SU>
+    for (su in present_sub) {
+      if (!sum(is.finite(csn_score))) next
+      r <- residualize_vector(
+        y = prot0[su, ], csn_score = csn_score,
+        batch = batch_all, covars = sa_all, min_n = 8L
+      )
+      log_msg("  [DPS|%s|%s] predictor=RESIDUAL_%s", version, basename(out_root), su)
+      .run_dps_fit(
+        M = M0, pred = r, version = version, ds_id = ds_id,
+        out_dir = file.path(out_ver, paste0("SU__RESIDUAL_", safe_fs_name(su))),
+        batch_all = batch_all, purity_all = purity_all, sa_all = sa_all,
+        mat_for_sv = M0
+      )
+    }
+    
+    ## (4) [NEW | DPS summary_wide] 將此 stratum × version 下所有 predictors 的結果彙整成一張寬表
+    {
+      ## out_ver 目前就是這個 version 的輸出資料夾，例如：
+      ##   <dataset>/<STRATUM>/DPS/<version>/
+      ## 裡面有很多子資料夾：SU__GPS1, SU__COPS2, SU__CSN_SCORE, SU__RESIDUAL_GPS1, ...
+      ## 我們會把每個 predictor 的 logFC / adj.P.Val 抽出來，寬合併成一張表
+      ## 並輸出成 out_ver/DPS_summary_wide.csv
+      
+      pred_dirs <- list.dirs(out_ver, full.names = TRUE, recursive = FALSE)
+      pred_dirs <- pred_dirs[grepl("^SU__", basename(pred_dirs))]
+      
+      wide_list <- list()
+      
+      for (pd in pred_dirs) {
+        pred_label <- sub("^SU__", "", basename(pd))  # 例如 "GPS1", "CSN_SCORE", "RESIDUAL_GPS1"
+        f_csv <- file.path(pd, "DPS_results.csv")
+        if (!file.exists(f_csv)) next
+        
+        tt_local <- try(data.table::fread(f_csv), silent = TRUE)
+        if (inherits(tt_local, "try-error") || !nrow(tt_local)) next
+        
+        ## 抓位點名稱。164版的 .run_dps_fit 會保證有 site_id。
+        ## 但為了兼容舊輸出，我們還是保留 fallback。
+        if ("site_id" %in% colnames(tt_local)) {
+          site_vec <- tt_local$site_id
+        } else if ("ID" %in% colnames(tt_local)) {
+          site_vec <- tt_local$ID
+        } else {
+          site_vec <- rownames(tt_local)
+        }
+        
+        tmp <- data.frame(
+          site_id    = site_vec,
+          logFC      = tt_local$logFC,
+          adj.P.Val  = tt_local$adj.P.Val,
+          stringsAsFactors = FALSE
+        )
+        
+        ## 同一個 site_id 若在該 predictor 出現重複列（例如 isoform/duplicate rownames），只保留第一列，避免 merge 產生笛卡兒爆炸
+        tmp <- tmp[!duplicated(tmp$site_id), , drop = FALSE]
+        
+        ## 重新命名成 <predictor>.logFC / <predictor>.adj.P.Val
+        colnames(tmp)[colnames(tmp) == "logFC"]     <- paste0(pred_label, ".logFC")
+        colnames(tmp)[colnames(tmp) == "adj.P.Val"] <- paste0(pred_label, ".adj.P.Val")
+        
+        wide_list[[pred_label]] <- tmp
+      }
+      
+      if (length(wide_list)) {
+        summary_wide <- Reduce(
+          function(x, y) merge(x, y, by = "site_id", all = TRUE),
+          wide_list
+        )
+        data.table::fwrite(summary_wide, file.path(out_ver, "DPS_summary_wide.csv"))
+      }
+    }
+    
+  }
+  invisible(NULL)
+}
+
+## ---- [NEW | DPS 主程式] 依序處理 datasets（只跑 DPS，不做 PTM-SEA） ----
+if (isTRUE(RUN_DPS_ONLY)) {
+  # [FIX] 直接沿用主流程已建立的 dataset_dirs_run（已含 combo 與 start_from 規則）
+  dataset_dirs_run_dps <- get("dataset_dirs_run", inherits = TRUE)
+  if (is.null(dataset_dirs_run_dps) || !length(dataset_dirs_run_dps)) {
+    stop("dataset_dirs_run 未定義或為空；請先於主流程建立 datasets 與 combo 選取。")
+  }
+  log_msg("[DPS] 將處理 datasets：%s", paste(names(dataset_dirs_run_dps), collapse=","))
+  
+  for (ds in names(dataset_dirs_run_dps)) {
+    ds_dir <- dataset_dirs_run_dps[[ds]]; ds_id <- ds
+    
+    # 讀 site-level 矩陣（與模板相同）
+    M_site_full <- try(load_phosphosite_matrix_from_dataset_dir(ds_dir), silent = TRUE)
+    if (inherits(M_site_full, "try-error") || is.null(dim(M_site_full))) {
+      log_msg("[DPS] %s 無法讀取 site 矩陣 → skip", ds); next
+    }
+    
+    # 讀 protein 矩陣（建立 predictors 用）
+    prot0_full <- try(load_matrix_from_dataset_dir(ds_dir), silent = TRUE)
+    if (inherits(prot0_full, "try-error") || is.null(dim(prot0_full))) {
+      log_msg("[DPS] %s 無 protein 矩陣 → skip", ds); next
+    }
+    
+    # 與模板一致：LUSC 特例（欄位結構不相容）直接略過
+    if (identical(ds, "lusc_cptac_2021")) { log_msg("[DPS] LUSC 特例：略過 site-level"); next }
+    
+    # 分層樣本
+    all_ids  <- colnames(M_site_full)
+    tp53_all <- get_tp53_status(ds_dir, all_ids)
+    keep_all <- all_ids
+    keep_mt  <- names(tp53_all)[tp53_all == "TP53_mutant"]
+    keep_wt  <- names(tp53_all)[tp53_all == "TP53_wild_type"]
+    
+    # 決定輸出根目錄（完全依你命名：phospho_<combo>_ DPS）
+    base_root <- if (!is.null(COMBO_PREFIX_DPS)) file.path(COMBO_PREFIX_DPS, ds) else
+      file.path(ds_dir, "phospho_DPS_results_TP53")
+    
+    # 執行各分層（版本由 options(csn.run_passes) 控制，combo_2 預設只跑 BatchAdj）
+    run_dps_stratum(ds_id, ds_dir, M_site_full, keep_all, file.path(base_root, "ALL", "DPS"), prot0_full)
+    if (length(keep_mt) >= (2L * min_per_group))
+      run_dps_stratum(ds_id, ds_dir, M_site_full, keep_mt, file.path(base_root, "TP53_mutant", "DPS"), prot0_full)
+    if (length(keep_wt) >= (2L * min_per_group))
+      run_dps_stratum(ds_id, ds_dir, M_site_full, keep_wt, file.path(base_root, "TP53_wild_type", "DPS"), prot0_full)
+    
+    log_msg("[DPS] 完成資料集：%s → %s", ds, base_root)
+  }
+}
+
