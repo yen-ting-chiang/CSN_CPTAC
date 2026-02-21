@@ -1,0 +1,17 @@
+seed: 1234.0
+min_frac_complete: 0.3
+minSize: 5.0
+maxSize: 1000.0
+fgsea_eps: 1.0e-10
+min_per_group: 8.0
+datasets:
+- brca_cptac_2020
+- luad_cptac_2020
+- ucec_cptac_2020
+- coad_cptac_2019
+- gbm_cptac_2021
+- paad_cptac_2021
+strata:
+- ALL
+- TP53_mutant
+- TP53_wild_type
