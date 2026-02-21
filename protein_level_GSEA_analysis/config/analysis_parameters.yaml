@@ -1,0 +1,117 @@
+# ====================================================================
+# Analysis Configuration File
+# CSN CPTAC Proteomic GSEA Analysis
+# ====================================================================
+
+# ---- Random Seed ----
+random_seed: 1234
+
+# ---- CSN Subunits ----
+csn_subunits:
+  - GPS1
+  - COPS2
+  - COPS3
+  - COPS4
+  - COPS5
+  - COPS6
+  - COPS7A
+  - COPS7B
+  - COPS8
+  - COPS9
+
+# ---- Gene Completeness ----
+min_frac_complete: 0.75  # Minimum 75% non-NA values per gene
+
+# ---- GSEA Parameters ----
+gsea:
+  minSize: 5
+  maxSize: 1000
+  fgsea_eps: 1.0e-10
+
+# ---- Sample Size Requirements ----
+min_per_group: 8  # Minimum samples for High/Low groups
+
+# ---- Batch Effect Parameters ----
+batch:
+  pipe_policy: "NA"  # "NA" or "b_small" for values containing "|"
+  min_per_level: 2   # Merge levels below this threshold to "b_small"
+
+# ---- Analysis Passes ----
+run_passes:
+  - BatchAdj  # Include batch correction
+
+# ---- Gene Set Collections ----
+# Which MSigDB collections to run (e.g., "H", "C2:CP:REACTOME", "C6")
+geneset_groups_to_run:
+  - H
+
+# ---- Heatmap Parameters ----
+heatmap:
+  dataset:
+    top_n: 25      # Top N pathways by NES
+    bottom_n: 25   # Bottom N pathways by NES
+  pan:
+    top_n: 25      # Top N pathways by Z-score
+    bottom_n: 25   # Bottom N pathways by Z-score
+  plot_dataset_collections: null  # null = plot all
+  plot_pan_collections: null      # null = plot all
+
+# ---- Execution Control ----
+make_plots: false  # Set to true to generate plots during analysis
+run_limma: true    # Set to false to skip limma analysis
+
+# ---- Dataset Configuration ----
+datasets:
+  root: "."  # Dataset root directory (set to getwd() in script)
+  ids:
+    - brca_cptac_2020
+    - luad_cptac_2020
+    - lusc_cptac_2021
+    - ucec_cptac_2020
+    - coad_cptac_2019
+    - gbm_cptac_2021
+    - paad_cptac_2021
+
+# ---- TP53 Stratification ----
+strata:
+  - ALL
+  - TP53_mutant
+  - TP53_wild_type
+
+# ---- TP53 Protein-Altering Variants ----
+tp53_keep_classes:
+  - MISSENSE_MUTATION
+  - NONSENSE_MUTATION
+  - FRAME_SHIFT_DEL
+  - FRAME_SHIFT_INS
+  - IN_FRAME_DEL
+  - IN_FRAME_INS
+  - SPLICE_SITE
+  - TRANSLATION_START_SITE
+  - NONSTOP_MUTATION
+
+# ---- Output Configuration ----
+output:
+  gsea_prefix: "proteomic_GSEA"  # Output directory prefix
+  run_info_dir: "run_info"       # Audit and metadata directory
+
+# ---- Covariate Selection ----
+covariates:
+  min_coverage:
+    purity: 0.60
+    sex: 0.80
+    age: 0.80
+  max_abs_cor: 0.30  # Max correlation with predictor
+  min_pairs: 20      # Minimum pairs for correlation calculation
+  use_age_missing_indicator: false  # Set true to add age_missing and age_z_imputed
+
+# ---- Meta-Analysis ----
+meta_analysis:
+  exclude_datasets:
+    - lusc_cptac_2021  # Exclude from meta-analysis
+
+# ---- Multiple Testing Policy ----
+# Per-dataset/stratum: fgsea padj controls FDR
+# Pan-cancer meta-analysis: Stouffer's Z → Benjamini-Hochberg FDR
+
+# ---- End of Configuration ----
